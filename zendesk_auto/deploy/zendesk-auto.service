@@ -1,0 +1,23 @@
+[Unit]
+Description=Zendesk recommendation console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zendesk-auto
+Group=zendesk-auto
+WorkingDirectory=/opt/zendesk-auto
+EnvironmentFile=/opt/zendesk-auto/.env
+ExecStart=/opt/zendesk-auto/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8080 --workers 1
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/zendesk-auto/data
+
+[Install]
+WantedBy=multi-user.target
