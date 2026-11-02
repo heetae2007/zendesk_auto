@@ -5,7 +5,7 @@ from .domain import redact,NAMES
 
 def split(v):return [s.strip() for s in re.split(r'[,\n]',str(v or '')) if s.strip()]
 
-def import_xlsx(data):
+def import_xlsx(data,known_names=None):
     import openpyxl
     wb=openpyxl.load_workbook(BytesIO(data),read_only=True,data_only=True)
     grouped=defaultdict(list);tab_counts={};bad_ids=0
@@ -27,7 +27,7 @@ def import_xlsx(data):
                     tid=int(num)
                 except (ValueError,TypeError):bad_ids+=1;continue
                 n+=1
-                participants=[p for p in split(val('개발담당자/PIS담당자')) if p in NAMES]
+                participants=[p for p in split(val('개발담당자/PIS담당자')) if p in (known_names if known_names is not None else NAMES)]
                 grouped[tid].append({'source':ws.title,'hospital':str(val('요청병원') or ''),
                     'summary':redact(val('요청내용요약')), 'parts':split(val('관련파트')),
                     'participants':participants,'type':str(val('구분') or ''),

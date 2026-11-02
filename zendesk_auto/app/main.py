@@ -12,6 +12,8 @@ from .store import Store,Sheets,revision
 from .clients import Zendesk,AI,Telegram
 from .engine import Engine
 from .importer import import_xlsx
+from .analytics import Analytics
+from .telegram_format import format_notification
 
 def load_env():
     p=Path('.env')
@@ -27,7 +29,7 @@ def make_store():
     elif mode!='local':raise ValueError('STORE_MODE must be local or sheets')
     return Store(os.getenv('DATA_DIR','./data'),sheets)
 
-store=make_store();engine=Engine(store,Zendesk(),AI(store.root),Telegram());stop=threading.Event()
+store=make_store();analytics=Analytics(store);engine=Engine(store,Zendesk(),AI(store.root,analytics),Telegram(),analytics);stop=threading.Event()
 security=HTTPBasic(auto_error=False)
 
 def auth(creds:HTTPBasicCredentials|None=Depends(security)):
@@ -75,7 +77,7 @@ def state():
         'history_count':len(store.history),'completed_count':sum(r.get('completed',False) for r in store.history),
         'last_tick':store.state['last_tick'],'last_error':store.state['last_error'],
         'notifications':store.state['notifications'],
-        'connections':{'zendesk':bool(os.getenv('ZENDESK_API_TOKEN')),'openai':bool(os.getenv('OPENAI_API_KEY') and os.getenv('OPENAI_MODEL')),
+        'connections':{'zendesk':bool(os.getenv('ZENDESK_API_TOKEN')),'claude':bool(os.getenv('ANTHROPIC_API_KEY') and os.getenv('ANTHROPIC_MODEL','claude-sonnet-4-6')),
             'telegram':bool(os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID'))}}
 
 @app.post('/api/config',dependencies=[Depends(auth)])
@@ -144,11 +146,84 @@ def simulate(body:dict):
     c=copy.deepcopy(store.config)
     # Local simulation uses a synthetic hospital field. No Zendesk requests.
     c['settings']['mapping']['hospital_field_id']='simulation'
-    now=datetime.fromisoformat(body.get('at') or datetime.now(KST).isoformat())
+    try:now=datetime.fromisoformat(body.get('at') or datetime.now(KST).isoformat())
+    except (ValueError,TypeError):raise HTTPException(400,'테스트 일시가 올바르지 않습니다.')
     if now.tzinfo is None:now=now.replace(tzinfo=KST)
     allowed,why=operating(c,now)
     if not allowed:return {'status':'deferred','reason':why}
-    try:return engine.analyze({'id':0,'subject':text,'description':'','custom_fields':[{'id':'simulation','value':body.get('hospital','')}]},c,{},[],now)
-    except Exception as e:raise HTTPException(503,'분석 실패: '+type(e).__name__)
+    try:result=engine.analyze({'id':0,'subject':text,'description':'','custom_fields':[{'id':'simulation','value':body.get('hospital','')}]},c,{},[],now,True)
+    except Exception as e:
+        from .clients import IntegrationError
+        detail=str(e) if isinstance(e,IntegrationError) else type(e).__name__
+        raise HTTPException(503,'분석 실패: '+detail)
+    result['telegram_status']='not_requested'
+    if body.get('send_telegram') is True:
+        # Synthetic test only: no real ticket ID or Zendesk URL and no ticket mutation.
+        message=format_notification(result,simulation=True)
+        if not os.getenv('TELEGRAM_BOT_TOKEN') or not os.getenv('TELEGRAM_CHAT_ID'):
+            result['telegram_status']='not_configured'
+        else:
+            try:
+                engine.telegram.send(message)
+                result['telegram_status']='sent'
+            except Exception:
+                # A timeout may happen after delivery. Do not automatically retry.
+                result['telegram_status']='unknown'
+    return result
+
+@app.get('/api/analytics',dependencies=[Depends(auth)])
+def analytics_dashboard(query:str=''):
+    with analytics.lock:
+        cases=list(analytics.cases.values())
+        if query:
+            q=query.strip().casefold()
+            cases=[c for c in cases if q in str(c['ticket_id']) or q in (c.get('hospital') or '').casefold()]
+        cases.sort(key=lambda c:(not bool(c.get('decision')),bool(c.get('review')),-c['ticket_id']))
+        return {'summary':analytics.summary(),'cases':copy_data(cases[:250]),'total_matches':len(cases),
+            'usage':copy_data(analytics.usage[-200:][::-1]),'prompts':copy_data(analytics.prompts[-30:][::-1]),
+            'active_prompt':'base-0.8-pre-review'+('+'+str(store.config['settings']['prompt_improvement']['id']) if store.config['settings'].get('prompt_improvement') else '')}
+
+def copy_data(obj):
+    import copy
+    return copy.deepcopy(obj)
+
+@app.post('/api/analytics/import',dependencies=[Depends(auth)])
+async def analytics_import(file:UploadFile=File(...)):
+    data=await file.read(20*1024*1024+1)
+    if len(data)>20*1024*1024:raise HTTPException(413,'20MB 이하 파일을 사용하세요.')
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as z:
+            if sum(x.file_size for x in z.infolist())>100*1024*1024:raise ValueError('압축 해제 용량 초과')
+        names={a['name'] for a in store.config['agents'] if a.get('name')}
+        rows,report=import_xlsx(data,names)
+        if not rows:raise ValueError('티켓번호 열과 데이터를 찾을 수 없습니다.')
+        return {'file':report,'comparison':analytics.import_cases(rows)}
+    except Exception as e:raise HTTPException(400,'평가 파일 가져오기 실패: '+type(e).__name__)
+
+@app.post('/api/analytics/review/{tid}',dependencies=[Depends(auth)])
+def analytics_review(tid:int,body:dict):
+    try:return analytics.review_case(tid,body)
+    except (ValueError,TypeError,KeyError) as e:raise HTTPException(400,str(e))
+
+@app.post('/api/analytics/propose',dependencies=[Depends(auth)])
+def analytics_propose():
+    try:return analytics.propose()
+    except ValueError as e:raise HTTPException(400,str(e))
+
+@app.post('/api/analytics/apply',dependencies=[Depends(auth)])
+def analytics_apply(body:dict):
+    try:
+        analytics.apply(str(body['id']),str(body['revision']))
+        return {'ok':True}
+    except (ValueError,KeyError) as e:raise HTTPException(409,str(e))
+    except Exception:raise HTTPException(503,'설정 저장 실패')
+
+@app.post('/api/analytics/reset',dependencies=[Depends(auth)])
+def analytics_reset(body:dict):
+    try:
+        c=copy_data(store.config);c['settings'].pop('prompt_improvement',None)
+        store.save_config(c,str(body['revision']));return {'ok':True}
+    except (ValueError,KeyError) as e:raise HTTPException(409,str(e))
+    except Exception:raise HTTPException(503,'설정 저장 실패')
 
 app.mount('/static',StaticFiles(directory=Path(__file__).parent/'static'),name='static')

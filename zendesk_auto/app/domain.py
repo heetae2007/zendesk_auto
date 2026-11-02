@@ -1,10 +1,15 @@
 """Pure routing policy. No network or Zendesk writes in this module."""
-import re
+import re, unicodedata
 from datetime import datetime, date, time
 from zoneinfo import ZoneInfo
 from collections import Counter
 
 KST = ZoneInfo('Asia/Seoul')
+EXCLUDED_AGENT_NAMES = frozenset({'윤세라','윤새라'})
+
+def allowed_agent(agent):
+    name=unicodedata.normalize('NFC',''.join(str(agent.get('name','')).split()))
+    return bool(name) and name not in EXCLUDED_AGENT_NAMES
 NAMES = ['김종오', '이선주', '김희재', '김성지', '김정진', '오형진', '박지원', '윤새라', '김구현', '이정기', '채희태', '신승용']
 
 def defaults():
@@ -13,7 +18,7 @@ def defaults():
             'exclude_weekends': True, 'exclude_holidays': True, 'notify': False, 'ai_enabled': False,
             'min_confidence': .90, 'holiday_country': 'KR', 'mapping': {},
             'message': '안녕하세요. 문의하신 #[티켓번호]이 접수 되었습니다.\n\n담당 파트에 확인 후 회신 드리겠습니다.\n\n감사합니다.'},
-        'agents': [{'id': f'agent-{i+1}', 'name': n, 'active': True, 'parts': [],
+        'agents': [{'id': f'agent-{i+1}', 'name': n, 'active': n not in EXCLUDED_AGENT_NAMES, 'parts': [],
             'zendesk_id': None, 'option_value': '', 'max_load': 20} for i,n in enumerate(NAMES)],
         'rules': [], 'roster': [], 'calendar': [], 'feedback': [], 'hospitals': [],
     }
@@ -63,6 +68,14 @@ def validate_config(c):
         ids = [x['id'] for x in c[table]]
         if len(ids) != len(set(ids)): raise ValueError(f'{table}: ID 중복')
     agents = {x['id'] for x in c['agents']}
+    absence_ids = set()
+    for entry in s.get('absences', []):
+        if entry.get('id') in absence_ids or not entry.get('id'): raise ValueError('부재 일정 ID 오류')
+        absence_ids.add(entry['id'])
+        if entry.get('agent_id') not in agents: raise ValueError('등록되지 않은 부재 담당자')
+        start = date.fromisoformat(entry['start'])
+        end = date.fromisoformat(entry['end'])
+        if end < start: raise ValueError('부재 종료일은 시작일 이후여야 합니다.')
     seen = set()
     for r in c['roster']:
         date.fromisoformat(r['date'])
@@ -96,14 +109,31 @@ def rule_part(config, text, hospital):
 
 def choose_agent(config, part, day, loads):
     roster = next((r for r in config['roster'] if r['date']==day and r['part']==part),None)
-    if not roster: return None, '해당 날짜·파트의 담당자가 지정되지 않았습니다.'
-    agents = {a['id']: a for a in config['agents']}
+    agents = {a['id']: a for a in config['agents'] if allowed_agent(a)}
+    absent = {x['agent_id'] for x in config['settings'].get('absences', []) if x['start'] <= day <= x['end']}
+    if not roster:
+        candidates = [a for a in agents.values() if a['active'] and a['id'] not in absent and part in a['parts'] and loads.get(a['id'],0)<a['max_load']]
+        if not candidates:return None, '해당 파트에 배정 가능한 상시 담당자가 없습니다.'
+        return min(candidates,key=lambda a:(loads.get(a['id'],0)/a['max_load'],a['id'])), '상시 담당자'
     for tier in ('primary','backup'):
-        candidates = [agents[x] for x in roster[tier] if x in agents and agents[x]['active'] and part in agents[x]['parts']]
+        candidates = [agents[x] for x in roster[tier] if x in agents and x not in absent and agents[x]['active'] and part in agents[x]['parts']]
         candidates = [a for a in candidates if loads.get(a['id'],0) < a['max_load']]
         if candidates:
             return min(candidates,key=lambda a:(loads.get(a['id'],0)/a['max_load'], a['id'])), tier
     return None, '배정 가능한 주담당·대체 담당자가 없거나 권장 업무량을 초과했습니다.'
+
+def eligible_agents(config, part, day, loads):
+    """Return eligible agents in priority tiers, with no inferred availability."""
+    agents={a['id']:a for a in config['agents'] if allowed_agent(a)}
+    absent={x['agent_id'] for x in config['settings'].get('absences',[]) if x['start']<=day<=x['end']}
+    def eligible(a):
+        return a['active'] and a['id'] not in absent and part in a['parts'] and loads.get(a['id'],0)<a['max_load']
+    roster=next((r for r in config['roster'] if r['date']==day and r['part']==part),None)
+    if not roster:return [a for a in agents.values() if eligible(a)]
+    for tier in ('primary','backup'):
+        group=[agents[x] for x in roster[tier] if x in agents and eligible(agents[x])]
+        if group:return group
+    return []
 
 def ngrams(s):
     s = re.sub(r'\s+', '', s.casefold())
@@ -112,6 +142,34 @@ def ngrams(s):
 def similarity(a,b):
     aa,bb=ngrams(a),ngrams(b)
     return len(aa&bb)/len(aa|bb) if aa and bb else 0.0
+
+def is_pre_review_screen(text):
+    """Conservative screen-specific recognition; generic 사전심사 mentions are not enough."""
+    return bool(re.search(r'사전\s*심사\s*(?:화면|창|메뉴)',str(text or ''),re.IGNORECASE))
+
+def apply_pre_review_rule(assignments,available):
+    """One per required part; preserve model priority and other unrelated parts."""
+    output=copy_assignments(assignments)
+    for part in ('원무','보험'):
+        row=next((item for item in output if item['part']==part),None)
+        if row is None:
+            row={'part':part,'part_id':None,'role':'UNDETERMINED',
+                'responsibility':'사전심사 화면과 관련된 '+part+' 업무 확인',
+                'agents':[],'supporting_ticket_ids':[]}
+            output.append(row)
+        if len(row['agents'])>1:
+            row['agents']=row['agents'][:1]
+        if not row['agents']:
+            candidates=[a for a in available if part in a['parts'] and allowed_agent(a)]
+            if len(candidates)==1:
+                a=candidates[0]
+                row['agents']=[{'agent_id':a['id'],'agent_name':a['name'],
+                    'reason':'사전심사 화면 규칙과 유일한 배정 가능 담당자'}]
+    return output
+
+def copy_assignments(assignments):
+    import copy
+    return copy.deepcopy(assignments)
 
 def lexical_search(text, history, hospital='', limit=5, completed_only=True):
     rows=[]
