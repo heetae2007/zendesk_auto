@@ -26,6 +26,8 @@ def format_notification(result, ticket_id=None, simulation=False):
         person=_safe(raw,80) if allowed_agent({'name':raw}) else ''
         if person and not person.endswith('책임님'):person+=' 책임님'
         heading=urgent_prefix+f'[{hospital}] {part} {person or "담당자 미정"}'
+    if result.get('pis_name'):
+        heading += ' / PIS ' + _safe(result['pis_name'],80) + ' 책임님'
     # The raw ticket is never sent; only generated, pattern-masked summaries.
     summary=_safe(result.get('summary'),350) if result.get('confidence') is not None else ''
     if not summary:summary='문의 요약을 확인해 주세요.'

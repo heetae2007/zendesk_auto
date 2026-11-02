@@ -1,5 +1,5 @@
 """Pure routing policy. No network or Zendesk writes in this module."""
-import re, unicodedata
+import re, unicodedata, json
 from datetime import datetime, date, time
 from zoneinfo import ZoneInfo
 from collections import Counter
@@ -18,7 +18,7 @@ def defaults():
             'exclude_weekends': True, 'exclude_holidays': True, 'notify': False, 'ai_enabled': False,
             'min_confidence': .90, 'holiday_country': 'KR', 'mapping': {},
             'message': '안녕하세요. 문의하신 #[티켓번호]이 접수 되었습니다.\n\n담당 파트에 확인 후 회신 드리겠습니다.\n\n감사합니다.'},
-        'agents': [{'id': f'agent-{i+1}', 'name': n, 'active': n not in EXCLUDED_AGENT_NAMES, 'parts': [],
+        'agents': [{'id': f'agent-{i+1}', 'name': n, 'active': n not in EXCLUDED_AGENT_NAMES,
             'zendesk_id': None, 'option_value': '', 'max_load': 20} for i,n in enumerate(NAMES)],
         'rules': [], 'roster': [], 'calendar': [], 'feedback': [], 'hospitals': [],
     }
@@ -76,64 +76,25 @@ def validate_config(c):
         start = date.fromisoformat(entry['start'])
         end = date.fromisoformat(entry['end'])
         if end < start: raise ValueError('부재 종료일은 시작일 이후여야 합니다.')
-    seen = set()
-    for r in c['roster']:
-        date.fromisoformat(r['date'])
-        key = (r['date'], r['part'])
-        if key in seen: raise ValueError('같은 날짜·파트의 당번이 중복됩니다.')
-        seen.add(key)
-        if not set(r['primary'] + r['backup']) <= agents: raise ValueError('등록되지 않은 담당자')
     dates = [x['date'] for x in c['calendar']]
     if len(dates) != len(set(dates)): raise ValueError('제외 날짜가 중복됩니다.')
     for d in dates: date.fromisoformat(d)
     for a in c['agents']:
         if a['max_load'] < 1: raise ValueError('권장 업무량은 1 이상이어야 합니다.')
-    for r in c['rules']:
-        if not r.get('part'): raise ValueError('규칙에 담당 파트가 필요합니다.')
-        if not r.get('hospital') and not r.get('keywords'): raise ValueError('규칙에 병원 또는 키워드 조건이 필요합니다.')
+    works = set()
+    for w in s.get('work_mappings', []):
+        if not isinstance(w.get('part'), str) or not w['part'].strip() or not isinstance(w.get('work'), str) or not w['work'].strip():
+            raise ValueError('세부업무 기준에 파트와 세부업무가 필요합니다.')
+        if (w['part'], w['work']) in works: raise ValueError(f"세부업무 기준 중복: {w['part']}/{w['work']}")
+        works.add((w['part'], w['work']))
+        if not isinstance(w.get('active', True), bool): raise ValueError('세부업무 사용 여부 오류')
+    from .pis import validate_settings
+    from .catalog import validate as validate_catalog
+    validate_settings(s); validate_catalog(c)
+    if not isinstance(s.get('live_writes', False), bool): raise ValueError('실제 접수 설정 오류')
+    # Google Sheets stores settings as one JSON cell (50,000 characters maximum).
+    if len(json.dumps(s, ensure_ascii=False)) > 45000: raise ValueError('운영 설정이 너무 큽니다. 지난 젠콜 일정을 정리하세요.')
     return c
-
-def rule_part(config, text, hospital):
-    matches = []
-    for r in config['rules']:
-        if not r.get('active',True): continue
-        if r.get('hospital') and r['hospital'] != hospital: continue
-        keywords = r.get('keywords', [])
-        if keywords and not any(k.casefold() in text.casefold() for k in keywords): continue
-        matches.append(r)
-    if not matches: return None
-    matches.sort(key=lambda x: x['priority'], reverse=True)
-    best = [x for x in matches if x['priority'] == matches[0]['priority']]
-    if len({x['part'] for x in best}) > 1: return {'conflict': True}
-    return {'part': best[0]['part'], 'rule_id': best[0]['id']}
-
-def choose_agent(config, part, day, loads):
-    roster = next((r for r in config['roster'] if r['date']==day and r['part']==part),None)
-    agents = {a['id']: a for a in config['agents'] if allowed_agent(a)}
-    absent = {x['agent_id'] for x in config['settings'].get('absences', []) if x['start'] <= day <= x['end']}
-    if not roster:
-        candidates = [a for a in agents.values() if a['active'] and a['id'] not in absent and part in a['parts'] and loads.get(a['id'],0)<a['max_load']]
-        if not candidates:return None, '해당 파트에 배정 가능한 상시 담당자가 없습니다.'
-        return min(candidates,key=lambda a:(loads.get(a['id'],0)/a['max_load'],a['id'])), '상시 담당자'
-    for tier in ('primary','backup'):
-        candidates = [agents[x] for x in roster[tier] if x in agents and x not in absent and agents[x]['active'] and part in agents[x]['parts']]
-        candidates = [a for a in candidates if loads.get(a['id'],0) < a['max_load']]
-        if candidates:
-            return min(candidates,key=lambda a:(loads.get(a['id'],0)/a['max_load'], a['id'])), tier
-    return None, '배정 가능한 주담당·대체 담당자가 없거나 권장 업무량을 초과했습니다.'
-
-def eligible_agents(config, part, day, loads):
-    """Return eligible agents in priority tiers, with no inferred availability."""
-    agents={a['id']:a for a in config['agents'] if allowed_agent(a)}
-    absent={x['agent_id'] for x in config['settings'].get('absences',[]) if x['start']<=day<=x['end']}
-    def eligible(a):
-        return a['active'] and a['id'] not in absent and part in a['parts'] and loads.get(a['id'],0)<a['max_load']
-    roster=next((r for r in config['roster'] if r['date']==day and r['part']==part),None)
-    if not roster:return [a for a in agents.values() if eligible(a)]
-    for tier in ('primary','backup'):
-        group=[agents[x] for x in roster[tier] if x in agents and eligible(agents[x])]
-        if group:return group
-    return []
 
 def ngrams(s):
     s = re.sub(r'\s+', '', s.casefold())
@@ -147,24 +108,15 @@ def is_pre_review_screen(text):
     """Conservative screen-specific recognition; generic 사전심사 mentions are not enough."""
     return bool(re.search(r'사전\s*심사\s*(?:화면|창|메뉴)',str(text or ''),re.IGNORECASE))
 
-def apply_pre_review_rule(assignments,available):
-    """One per required part; preserve model priority and other unrelated parts."""
+PRE_REVIEW_PARTS=('원무','보험')
+
+def apply_pre_review_rule(assignments):
+    """Ensure one 원무 and one 보험 row; people are filled from the catalogue and trimmed to one each by the caller."""
     output=copy_assignments(assignments)
-    for part in ('원무','보험'):
-        row=next((item for item in output if item['part']==part),None)
-        if row is None:
-            row={'part':part,'part_id':None,'role':'UNDETERMINED',
-                'responsibility':'사전심사 화면과 관련된 '+part+' 업무 확인',
-                'agents':[],'supporting_ticket_ids':[]}
-            output.append(row)
-        if len(row['agents'])>1:
-            row['agents']=row['agents'][:1]
-        if not row['agents']:
-            candidates=[a for a in available if part in a['parts'] and allowed_agent(a)]
-            if len(candidates)==1:
-                a=candidates[0]
-                row['agents']=[{'agent_id':a['id'],'agent_name':a['name'],
-                    'reason':'사전심사 화면 규칙과 유일한 배정 가능 담당자'}]
+    for part in PRE_REVIEW_PARTS:
+        if not any(item['part']==part for item in output):
+            output.append({'part':part,'part_id':None,'role':'UNDETERMINED',
+                'responsibility':'사전심사 화면과 관련된 '+part+' 업무 확인','works':[],'supporting_ticket_ids':[]})
     return output
 
 def copy_assignments(assignments):

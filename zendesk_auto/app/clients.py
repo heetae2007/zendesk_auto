@@ -1,12 +1,16 @@
-import os, json
+import os, json, base64
 from urllib.parse import urlparse
-from .domain import redact, lexical_search, allowed_agent
+from .domain import redact, lexical_search
 from .prompt_multi import SYSTEM_PROMPT
 
 class IntegrationError(Exception): pass
+class WriteRejected(IntegrationError):
+    """Zendesk definitely did not apply the update (4xx, including safe-update 409)."""
+class WriteUnknown(IntegrationError):
+    """The update may or may not have been applied. Never retried automatically."""
 
 class Zendesk:
-    """Read-only client. This release contains no Zendesk update endpoint."""
+    """Reads tickets; update_ticket is called only by the gated intake path."""
     def __init__(self):
         import httpx
         domain=os.getenv('ZENDESK_SUBDOMAIN','edgennext')
@@ -33,14 +37,26 @@ class Zendesk:
 
     def metadata(self):
         return {'fields':self.all('/ticket_fields.json','ticket_fields'),
-            'forms':self.all('/ticket_forms.json','ticket_forms'),
+            'forms':self.forms(),
             'statuses':self.all('/custom_statuses.json','custom_statuses'),
             'groups':self.all('/groups.json','groups')}
+
+    def forms(self):return self.all('/ticket_forms.json','ticket_forms')
 
     def new_page(self,url=None):
         return self.get(url or '/search/export.json',None if url else {'query':'status:new','filter[type]':'ticket','page[size]':100})
 
     def ticket(self,tid):return self.get(f'/tickets/{int(tid)}.json')['ticket']
+
+    def update_ticket(self,tid,payload):
+        import httpx
+        try:r=self.http.put(f'{self.base}/tickets/{int(tid)}.json',json=payload)
+        except httpx.TimeoutException:raise WriteUnknown('Zendesk 응답 시간 초과') from None
+        except httpx.RequestError:raise WriteUnknown('Zendesk 연결 오류') from None
+        if r.status_code==409:raise WriteRejected('다른 사용자가 먼저 티켓을 변경했습니다 (409).')
+        if 400<=r.status_code<500:raise WriteRejected(f'Zendesk 변경 거부 HTTP {r.status_code}')
+        if r.status_code>=500:raise WriteUnknown(f'Zendesk HTTP {r.status_code}')
+        return r.json().get('ticket',{})
 
     def unresolved(self):
         rows=[];url=None
@@ -60,40 +76,14 @@ class AI:
         # Claude Messages has no embeddings endpoint; retain local lexical retrieval.
         return lexical_search(text,history,hospital), '문자 유사도 검색'
 
-    def classify(self,text,parts,examples,feedback,rule=None,context=None,improvement=None,available_agents=None,hospital=""):
+    def _post(self,system,content,schema,context,max_tokens=2048,timeout=45.0):
+        """One structured-output Messages call; returns the parsed JSON object."""
         model=os.getenv('ANTHROPIC_MODEL','claude-sonnet-4-6').strip()
         key=os.getenv('ANTHROPIC_API_KEY','').strip()
         if not model or not key:raise IntegrationError('Claude 모델/API 키 미설정')
-        nullable_string={'anyOf':[{'type':'string'},{'type':'null'}]}
-        agent_schema={'type':'object','additionalProperties':False,'properties':{
-            'agent_id':nullable_string,'agent_name':{'type':'string'},'reason':{'type':'string'}},
-            'required':['agent_id','agent_name','reason']}
-        assignment_schema={'type':'object','additionalProperties':False,'properties':{
-            'part':{'type':'string'},'part_id':nullable_string,
-            'role':{'type':'string','enum':['PRIMARY','COLLABORATOR','UNDETERMINED']},
-            'responsibility':{'type':'string'},'agents':{'type':'array','items':agent_schema},
-            'supporting_ticket_ids':{'type':'array','items':{'type':'integer'}}},
-            'required':['part','part_id','role','responsibility','agents','supporting_ticket_ids']}
-        schema={'type':'object','additionalProperties':False,'properties':{
-            'ticket_id':{'type':'integer'},'hospital':{'type':'string'},'summary':{'type':'string'},
-            'issue_type':{'type':'string','enum':['BUG','DATA_CHANGE','DATA_REQUEST','USAGE_QUESTION','OTHER','UNKNOWN']},
-            'recommended_assignments':{'type':'array','items':assignment_schema},
-            'confidence':{'type':'number'},'urgent':{'type':'boolean'},'urgent_reason':{'type':'string'},
-            'requires_manual_review':{'type':'boolean'},'review_reasons':{'type':'array','items':{'type':'string'}},
-            'reason':{'type':'string'}},
-            'required':['ticket_id','hospital','summary','issue_type','recommended_assignments','confidence','urgent','urgent_reason','requires_manual_review','review_reasons','reason']}
-        permitted=[a for a in (available_agents or []) if allowed_agent(a)]
-        allowed_names={a['name'] for a in permitted}
-        data={'ticket':{'ticket_id':(context or {}).get('ticket_id') or 0,'hospital':redact(hospital)[:150], 'request_department':redact((context or {}).get('department',''))[:150], 'text':redact(text)},
-            'available_parts':parts,'available_agents':permitted,
-            'historical_cases':[{'ticket_id':r['ticket_id'],'summary':redact(r['summary']),'parts':r['parts'],
-                'participants':[n for n in r.get('participants',[]) if n in allowed_names]} for r in examples],
-            'verified_feedback':feedback,'rule_hint':rule,
-            'reviewed_corrections':(improvement or {}).get('examples',[])}
         import httpx
-        system=SYSTEM_PROMPT
-        payload={'model':model,'max_tokens':2048,'system':system,
-            'messages':[{'role':'user','content':json.dumps(data,ensure_ascii=False)}],
+        payload={'model':model,'max_tokens':max_tokens,'system':system,
+            'messages':[{'role':'user','content':content}],
             'output_config':{'format':{'type':'json_schema','schema':schema}}}
         headers={'x-api-key':key,'anthropic-version':'2023-06-01','content-type':'application/json'}
         workspace=os.getenv('ANTHROPIC_WORKSPACE_ID','').strip()
@@ -110,7 +100,7 @@ class AI:
                 'cache_creation_input_tokens':token('cache_creation_input_tokens')})
             except (OSError,ValueError):pass
         try:
-            r=httpx.post('https://api.anthropic.com/v1/messages',headers=headers,json=payload,timeout=45.0)
+            r=httpx.post('https://api.anthropic.com/v1/messages',headers=headers,json=payload,timeout=timeout)
         except httpx.RequestError:
             record('network_error')
             raise IntegrationError('Claude 연결 또는 응답 지연') from None
@@ -130,6 +120,50 @@ class AI:
             out=json.loads(blocks[0])
             if not isinstance(out,dict):raise IntegrationError('Claude 응답 구조 오류')
         except (ValueError,TypeError,KeyError):raise IntegrationError('Claude 응답 분석 실패') from None
+        return out
+
+    def read_schedule(self,image,media_type,roster_names):
+        """Extract on-call rows from a schedule screenshot for human review."""
+        from .pis import SCHEDULE_SCHEMA,SCHEDULE_PROMPT
+        if media_type not in ('image/png','image/jpeg','image/webp'):raise IntegrationError('PNG, JPEG, WebP 이미지만 지원합니다.')
+        content=[{'type':'image','source':{'type':'base64','media_type':media_type,'data':base64.standard_b64encode(image).decode()}},
+            {'type':'text','text':json.dumps({'pis_roster':list(roster_names)},ensure_ascii=False)}]
+        out=self._post(SCHEDULE_PROMPT,content,SCHEDULE_SCHEMA,{'purpose':'pis_schedule','prompt_version':'pis-schedule-1.0'},max_tokens=8000,timeout=120.0)
+        if set(out)!={'days','warnings'} or not isinstance(out['days'],list) or not isinstance(out['warnings'],list):raise IntegrationError('배정표 응답 구조 오류')
+        for d in out['days']:
+            if not isinstance(d,dict) or set(d)!=set(SCHEDULE_SCHEMA['properties']['days']['items']['required']):raise IntegrationError('배정표 응답 구조 오류')
+            for k in ('call1','call2','call3','leave'):
+                if not isinstance(d[k],list) or not all(isinstance(x,str) for x in d[k]):raise IntegrationError('배정표 응답 구조 오류')
+            for k in ('month','day'):
+                if d[k] is not None and (isinstance(d[k],bool) or not isinstance(d[k],int)):raise IntegrationError('배정표 날짜 형식 오류')
+        return out
+
+    def classify(self,text,parts,examples,improvement=None,context=None,hospital="",work_items=None):
+        """Summary, parts and works only. People are chosen from the catalogue by the caller."""
+        nullable_string={'anyOf':[{'type':'string'},{'type':'null'}]}
+        assignment_schema={'type':'object','additionalProperties':False,'properties':{
+            'part':{'type':'string'},'part_id':nullable_string,
+            'role':{'type':'string','enum':['PRIMARY','COLLABORATOR','UNDETERMINED']},
+            'responsibility':{'type':'string'},
+            'works':{'type':'array','items':{'type':'string'}},
+            'supporting_ticket_ids':{'type':'array','items':{'type':'integer'}}},
+            'required':['part','part_id','role','responsibility','works','supporting_ticket_ids']}
+        schema={'type':'object','additionalProperties':False,'properties':{
+            'ticket_id':{'type':'integer'},'hospital':{'type':'string'},'summary':{'type':'string'},
+            'issue_type':{'type':'string','enum':['BUG','DATA_CHANGE','DATA_REQUEST','USAGE_QUESTION','OTHER','UNKNOWN']},
+            'recommended_assignments':{'type':'array','items':assignment_schema},
+            'confidence':{'type':'number'},'urgent':{'type':'boolean'},'urgent_reason':{'type':'string'},
+            'requires_manual_review':{'type':'boolean'},'review_reasons':{'type':'array','items':{'type':'string'}},
+            'reason':{'type':'string'}},
+            'required':['ticket_id','hospital','summary','issue_type','recommended_assignments','confidence','urgent','urgent_reason','requires_manual_review','review_reasons','reason']}
+        data={'ticket':{'ticket_id':(context or {}).get('ticket_id') or 0,'hospital':redact(hospital)[:150], 'request_department':redact((context or {}).get('department',''))[:150], 'text':redact(text)},
+            'available_parts':parts,
+            'work_items':[{'part':w['part'],'work':w['work']} for w in (work_items or [])],
+            'historical_cases':[{'ticket_id':r['ticket_id'],'summary':redact(r['summary']),'parts':r['parts']} for r in examples],
+            'reviewed_corrections':(improvement or {}).get('examples',[])}
+        works_by_part={}
+        for w in work_items or []:works_by_part.setdefault(w['part'],set()).add(w['work'])
+        out=self._post(SYSTEM_PROMPT,json.dumps(data,ensure_ascii=False),schema,context)
         if set(out)!=set(schema['required']):raise IntegrationError('AI 응답 구조 오류')
         if isinstance(out['confidence'],bool) or not isinstance(out['confidence'],(int,float)) or not 0<=out['confidence']<=1:raise IntegrationError('AI 신뢰도 오류')
         if not isinstance(out['requires_manual_review'],bool) or not isinstance(out['urgent'],bool):raise IntegrationError('AI boolean 오류')
@@ -149,14 +183,8 @@ class AI:
             if item['part_id'] is not None:raise IntegrationError('확인되지 않은 파트 ID')
             if item['role'] not in ('PRIMARY','COLLABORATOR','UNDETERMINED') or not isinstance(item['responsibility'],str):raise IntegrationError('업무 역할 오류')
             if not isinstance(item['supporting_ticket_ids'],list) or any(isinstance(x,bool) or not isinstance(x,int) or x not in valid_examples for x in item['supporting_ticket_ids']):raise IntegrationError('존재하지 않는 근거 티켓')
-            if not isinstance(item['agents'],list) or len(item['agents'])>len(permitted):raise IntegrationError('담당자 목록 오류')
-            used=set()
-            for agent in item['agents']:
-                if not isinstance(agent,dict) or set(agent)!=set(agent_schema['required']) or not isinstance(agent['agent_name'],str) or not isinstance(agent['reason'],str):raise IntegrationError('담당자 구조 오류')
-                # IDs refer to the app's known roster. A null ID may be resolved only if the name matches uniquely.
-                matches=[a for a in permitted if a['name']==agent['agent_name'] and part in a['parts'] and (agent['agent_id'] is None or a['id']==agent['agent_id'])]
-                if len(matches)!=1 or matches[0]['id'] in used:raise IntegrationError('미등록·부재·제외·중복 담당자')
-                used.add(matches[0]['id']);agent['agent_id']=matches[0]['id'];agent['agent_name']=matches[0]['name'];agent['reason']=redact(agent['reason'])[:350]
+            if not isinstance(item['works'],list) or not all(isinstance(w,str) for w in item['works']) or len(set(item['works']))!=len(item['works']):raise IntegrationError('세부업무 목록 오류')
+            if any(w not in works_by_part.get(part,set()) for w in item['works']):raise IntegrationError('설정에 없는 세부업무')
             item['responsibility']=redact(item['responsibility'])[:350]
         out['summary']=redact(out['summary'])[:350];out['reason']=redact(out['reason'])[:350]
         out['urgent_reason']=redact(out['urgent_reason'])[:350];out['review_reasons']=[redact(x)[:350] for x in out['review_reasons'][:10]]

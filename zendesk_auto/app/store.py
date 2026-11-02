@@ -3,6 +3,7 @@ import os, json, tempfile, threading, copy, hashlib
 from pathlib import Path
 from datetime import datetime, timezone
 from .domain import defaults
+from .catalog import normalize
 
 def stamp(): return datetime.now(timezone.utc).isoformat()
 
@@ -24,7 +25,8 @@ class Store:
         self.lock=threading.RLock();self.sheets=sheets
         self.state=self.read('state',{'jobs':{},'scan':{},'last_error':None,'notifications':{},'last_tick':None})
         self.history=self.read('history',[])
-        self.config=defaults() if sheets else self.read('config',defaults())
+        # In Sheets mode config.json is the last copy confirmed with Sheets; show it until Sheets is read.
+        self.config=normalize(self.read('config',defaults()))
         self.ready=not bool(sheets)
 
     def read(self,name,default):
@@ -33,19 +35,28 @@ class Store:
 
     def save_state(self): atomic_json(self.root/'state.json',self.state)
 
+    def try_refresh(self):
+        """Startup/page load: keep the last saved copy if Sheets is unreachable."""
+        if not self.sheets or self.ready:return True
+        try:
+            with self.lock:self.refresh()
+            return True
+        except Exception:return False
+
     def refresh(self):
         if self.sheets:
             c=self.sheets.load_config()
             if c is None: raise ValueError('Google Sheets 초기화가 필요합니다.')
-            self.config=c; self.ready=True
-            atomic_json(self.root/'config.json',c)
+            self.config=normalize(c); self.ready=True
+            atomic_json(self.root/'config.json',self.config)
+        else:self.config=normalize(self.config)
         return self.config
 
     def save_config(self,c,expected):
         with self.lock:
             if self.sheets: self.refresh()
             if revision(self.config)!=expected: raise ValueError('다른 사용자가 설정을 변경했습니다. 새로고침 후 다시 저장하세요.')
-            before=self.config
+            c=normalize(copy.deepcopy(c));before=self.config
             if self.sheets: self.sheets.save_config(c)
             atomic_json(self.root/'config.json',c); self.config=copy.deepcopy(c)
             audit=self.read('config_audit',[])

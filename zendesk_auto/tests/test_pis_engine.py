@@ -1,0 +1,144 @@
+import copy
+import pytest
+from test_core import config, Z, A, T, ai_out, NOW
+from app.store import Store
+from app.engine import Engine
+from app.domain import validate_config
+from app.pis import normalize_schedule, pick_backlog
+from app.clients import AI, IntegrationError, WriteRejected, WriteUnknown
+
+DAY='2026-11-02'
+MAPS=[{'part':'보험','work':'심사','developer':'김종오','developer_backup':'이선주','pis':'노주영','pis_backup':'이혜경'},
+      {'part':'보험','work':'청구','developer':'이선주','developer_backup':'','pis':'노주영','pis_backup':'이혜경'}]
+
+def oncall(*rows):
+    return [{'date':DAY,'members':[{'name':n,'slot':'call1','absent':ab} for n,w,ab in rows]}]
+
+def roster(c,*rows,extra=()):
+    """rows: (name, weight, absent). Weight lives on the PIS member; the day only lists who is on call."""
+    c['settings']['pis_members']=[{'name':n,'active':True,'weight':w,'option_value':''} for n,w,_ in rows]+[{'name':n,'active':True,'weight':1,'option_value':''} for n in extra]
+    c['settings']['pis_days']=oncall(*rows)
+
+@pytest.fixture
+def system(tmp_path,monkeypatch):
+    monkeypatch.setenv('ZENDESK_API_TOKEN','fake-test-only')
+    monkeypatch.delenv('ALLOW_LIVE_WRITES',raising=False)
+    s=Store(tmp_path);s.config=config();z=Z();a=A();t=T();return s,z,a,t,Engine(s,z,a,t)
+
+def test_realtime_weights_from_ledger_and_never_off_roster(system):
+    s,z,a,t,e=system
+    roster(s.config,('A',30,False),('B',30,False),('C',40,False),('이혜경',50,True),extra=('김갑진',))
+    for tid in range(1,11):
+        e.pick_pis(s.config,tid,{},DAY)
+    counts={}
+    for v in s.state['pis'].values():counts[v['name']]=counts.get(v['name'],0)+1
+    assert counts=={'A':3,'B':3,'C':4}
+    # Re-analysing a ticket keeps its row: no double counting.
+    first=s.state['pis']['1']['name']
+    assert e.pick_pis(s.config,1,{},DAY)[0]==first and len(s.state['pis'])==10
+
+def test_inactive_member_is_not_assigned(system):
+    s,z,a,t,e=system
+    roster(s.config,('A',1,False));s.config['settings']['pis_members'][0]['active']=False
+    assert e.pick_pis(s.config,1,{},DAY)[0] is None
+
+def test_no_confirmed_oncall_means_review(system):
+    s,z,a,t,e=system;s.config['settings']['pis_days']=[];e.tick(NOW)
+    j=s.state['jobs']['1'];assert j['status']=='review' and not j['pis_name'] and 'PIS' in j['reason']
+
+def test_realtime_tick_sets_pis_and_telegram(system):
+    s,z,a,t,e=system;s.config['settings']['notify']=True
+    sent=[];t.send=lambda text:sent.append(text) or 1
+    e.tick(NOW);j=s.state['jobs']['1']
+    assert j['status']=='recommended' and j['pis_name']=='이혜경'
+    assert 'PIS 이혜경 책임님' in sent[0] and '김종오 책임님' in sent[0]
+
+def test_backlog_primary_then_backup_then_weighted_overflow(system):
+    s,z,a,t,e=system
+    s.config['settings']['work_mappings']=MAPS
+    roster(s.config,('노주영',1,False),('이혜경',1,False),('김갑진',2,False),('강지영',5,True),extra=('전진야',))
+    used=set();r={'recommended_assignments':[{'part':'보험','works':['심사']}]}
+    assert e.pick_pis(s.config,1,r,DAY,used)==('노주영','밀린 티켓 묶음: 주담당')
+    assert e.pick_pis(s.config,2,r,DAY,used)==('이혜경','밀린 티켓 묶음: 백업')
+    # Primary and backup are used: keep distributing by weight among today's on-call (never absent/off-call).
+    rest=[e.pick_pis(s.config,tid,r,DAY,used) for tid in range(3,9)]
+    assert all(reason.endswith('비중 순서 배정') for _,reason in rest)
+    names=[n for n,_ in rest];assert set(names)<={'노주영','이혜경','김갑진'} and names.count('김갑진')>=3
+    # No work at all still gets a PIS.
+    assert e.pick_pis(s.config,20,{'recommended_assignments':[{'part':'보험','works':[]}]},DAY,set())[0]
+
+def test_backlog_skips_off_roster_primary():
+    assert pick_backlog([MAPS[0]],{'이혜경'},set())==('이혜경','백업')
+    assert pick_backlog([MAPS[0]],{'강지영'},set())[0] is None
+    assert pick_backlog([{}],{'이혜경'},set())[0] is None
+
+def test_backlog_uses_part_default_when_no_work(system):
+    s,z,a,t,e=system;s.config['settings']['parts'][0].update(pis='김갑진')
+    roster(s.config,('김갑진',1,False),('이혜경',1,False))
+    assert e.pick_pis(s.config,1,{'recommended_assignments':[{'part':'보험','works':[]}]},DAY,set())==('김갑진','밀린 티켓 묶음: 주담당')
+
+def test_backlog_threshold_in_tick(system):
+    s,z,a,t,e=system
+    s.config['settings'].update(work_mappings=MAPS,pis_backlog_threshold=1);roster(s.config,('노주영',1,False))
+    a.out=ai_out(works=['심사']);e.tick(NOW)
+    j=s.state['jobs']['1'];assert j['pis_name']=='노주영' and j['pis_reason'].startswith('밀린 티켓')
+
+def test_only_catalogue_works_sent_and_people_from_catalogue(system):
+    s,z,a,t,e=system;s.config['settings']['work_mappings']=MAPS
+    s.config['settings']['parts'][1]['active']=False
+    a.out=ai_out(works=['청구']);e.tick(NOW);j=s.state['jobs']['1']
+    args,kw=a.calls[0]
+    assert args[1]==['보험'] and {w['work'] for w in kw['work_items']}=={'심사','청구'}
+    assert all(set(w)=={'part','work'} for w in kw['work_items'])  # no names are sent to Claude
+    assert j['recommended_assignments'][0]['agents'][0]['agent_name']=='이선주' and j['status']=='recommended'
+
+def test_missing_work_is_review(system):
+    s,z,a,t,e=system;s.config['settings']['work_mappings']=MAPS;e.tick(NOW)
+    assert '세부업무가 확인되지 않' in s.state['jobs']['1']['reason']
+
+def test_claude_invented_work_or_part_rejected(monkeypatch):
+    ai=AI(None);out=ai_out(works=['없는업무']);out['ticket_id']=0;out['hospital']='병원'
+    monkeypatch.setattr(ai,'_post',lambda *a,**k:copy.deepcopy(out))
+    with pytest.raises(IntegrationError,match='세부업무'):
+        ai.classify('문의',['보험'],[],None,{},'병원',work_items=MAPS)
+    out['recommended_assignments'][0]['works']=['심사']
+    assert ai.classify('문의',['보험'],[],None,{},'병원',work_items=MAPS)['recommended_assignments'][0]['works']==['심사']
+    out['recommended_assignments'][0]['part']='없는파트'
+    with pytest.raises(IntegrationError,match='파트'):ai.classify('문의',['보험'],[],None,{},'병원',work_items=MAPS)
+
+def test_schedule_normalization_requires_review():
+    out={'days':[
+        {'date_text':'#VALUE!','month':None,'day':None,'call1':['이혜경'],'call2':[],'call3':[],'leave':[],'notes':'','uncertain':True},
+        {'date_text':'11/3','month':11,'day':3,'call1':['이혜경'],'call2':['노주영'],'call3':['홍길동'],'leave':['노주영'],'notes':'','uncertain':False}],
+        'warnings':[]}
+    r=normalize_schedule(out,2026,['이혜경','노주영'])['days']
+    assert r[0]['date'] is None and '날짜 미확정' in r[0]['problems'] and '셀 오류 표시' in r[0]['problems']
+    assert r[1]['date']=='2026-11-03' and [m['name'] for m in r[1]['members']]==['이혜경','노주영']
+    assert r[1]['members'][1]['absent'] and any('홍길동' in p for p in r[1]['problems'])
+
+def test_read_schedule_validates_shape(monkeypatch):
+    ai=AI(None)
+    monkeypatch.setattr(ai,'_post',lambda *a,**k:{'days':[{'date_text':'x'}],'warnings':[]})
+    with pytest.raises(IntegrationError):ai.read_schedule(b'x','image/png',['이혜경'])
+    with pytest.raises(IntegrationError):ai.read_schedule(b'x','image/gif',['이혜경'])
+
+def test_config_rejects_unknown_oncall_and_duplicate_work():
+    c=config();c['settings']['pis_days']=oncall(('외부인',1,False))
+    with pytest.raises(ValueError):validate_config(c)
+    c=config();c['settings']['work_mappings']=[MAPS[0],MAPS[0]]
+    with pytest.raises(ValueError):validate_config(c)
+    c=config();roster(c,('이혜경',0,False))
+    with pytest.raises(ValueError):validate_config(c)
+    validate_config(config())
+
+def test_backlog_name_rules():
+    m={'part':'진료','work':'CPOE','pis':'한다연/조한슬','pis_backup':'강지영'}
+    assert pick_backlog([m],{'조한슬'},set())==('조한슬','주담당')
+    assert pick_backlog([{**m,'pis':'조한슬(데이터쿼리)'}],{'조한슬'},set())[0] is None
+
+def test_analysis_failure_still_gets_pis(system):
+    s,z,a,t,e=system
+    def fail(*args,**kw):raise TimeoutError()
+    a.classify=fail
+    for _ in range(4):e.tick(NOW)
+    j=s.state['jobs']['1'];assert j['status']=='review' and j['pis_name']=='이혜경'

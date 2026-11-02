@@ -14,6 +14,10 @@ from .engine import Engine
 from .importer import import_xlsx
 from .analytics import Analytics
 from .telegram_format import format_notification
+from .work_mapping import parse_workbook
+from .pis import members,active_names,on_call,counts as pis_counts,normalize_schedule,prune_days
+from .zendesk_write import live_enabled,preflight,suggest,expected_people
+from .catalog import unknown_people
 
 def load_env():
     p=Path('.env')
@@ -47,11 +51,50 @@ async def lifespan(app):
     lock=open(store.root/'instance.lock','a')
     try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError:raise RuntimeError('이미 실행 중입니다. workers=1로 실행하세요.')
+    # Load saved settings right away instead of waiting for the first one-minute tick.
+    store.try_refresh()
     stop.clear();thread=threading.Thread(target=loop,daemon=True);thread.start()
     yield
     stop.set();thread.join(timeout=35);lock.close()
 
 app=FastAPI(title='Zendesk 접수 운영실',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
+
+IMAGE_TYPES={b'\x89PNG\r\n\x1a\n':'image/png',b'\xff\xd8\xff':'image/jpeg'}
+
+def image_type(data):
+    if data[:4]==b'RIFF' and data[8:12]==b'WEBP':return 'image/webp'
+    return next((t for sig,t in IMAGE_TYPES.items() if data.startswith(sig)),None)
+
+@app.post('/api/pis/schedule/read',dependencies=[Depends(auth)])
+async def pis_schedule_read(file:UploadFile=File(...),year:int=0):
+    # Result is returned for human review only; nothing is saved here.
+    data=await file.read(5*1024*1024+1)
+    if len(data)>5*1024*1024:raise HTTPException(413,'5MB 이하 이미지를 사용하세요.')
+    kind=image_type(data)
+    if not kind:raise HTTPException(400,'PNG, JPEG, WebP 이미지만 지원합니다.')
+    year=year or datetime.now(KST).year
+    if not 2020<=year<=2100:raise HTTPException(400,'연도 범위 오류')
+    names=active_names(store.config['settings'])
+    try:out=engine.ai.read_schedule(data,kind,names)
+    except Exception as e:
+        from .clients import IntegrationError
+        raise HTTPException(503,'배정표 분석 실패: '+(str(e) if isinstance(e,IntegrationError) else type(e).__name__))
+    return normalize_schedule(out,year,names)
+
+@app.get('/api/zendesk/preflight',dependencies=[Depends(auth)])
+def zendesk_preflight():
+    if not os.getenv('ZENDESK_API_TOKEN'):raise HTTPException(400,'Zendesk 인증정보를 서버에 설정하세요.')
+    try:meta=engine.z.metadata()
+    except Exception:raise HTTPException(503,'Zendesk 설정 조회 실패. API 권한을 확인하세요.')
+    return {'check':preflight(store.config,meta),'options':suggest(store.config,meta)}
+
+@app.post('/api/jobs/{tid}/write-verify',dependencies=[Depends(auth)])
+def write_verify(tid:int):
+    if not engine.run_lock.acquire(blocking=False):raise HTTPException(409,'분석 완료 후 다시 시도하세요.')
+    try:return {'status':engine.verify_write(tid)}
+    except ValueError as e:raise HTTPException(400,str(e))
+    except Exception:raise HTTPException(503,'티켓 재조회 실패')
+    finally:engine.run_lock.release()
 
 @app.middleware('http')
 async def headers(request:Request,call_next):
@@ -70,8 +113,14 @@ def index():return FileResponse(Path(__file__).parent/'static/index.html')
 
 @app.get('/api/state',dependencies=[Depends(auth)])
 def state():
+    store.try_refresh()
     c=store.config;allowed,why=operating(c)
-    return {'config':c,'revision':revision(c),'mode':'추천 전용', 'storage':'Google Sheets' if store.sheets else '로컬 설정 테스트',
+    day=datetime.now(KST).date().isoformat();live=live_enabled(c)
+    return {'config':c,'revision':revision(c),'mode':'실제 접수' if live else '추천 전용',
+        'live':{'enabled':live,'env_allows':os.getenv('ALLOW_LIVE_WRITES','').strip().lower()=='true','setting':c['settings'].get('live_writes') is True},
+        'pis_today':{'date':day,'on_call':on_call(c['settings'],day),'counts':pis_counts(store.state.get('pis',{}),day)},
+        'pis_members':members(c['settings']),'catalog_warnings':unknown_people(c),
+        'writes':{k:{x:v.get(x) for x in ('status','at','error')} for k,v in store.state.get('writes',{}).items()}, 'storage':'Google Sheets' if store.sheets else '로컬 설정 테스트',
         'ready':store.ready,'operating':allowed,'operating_reason':why,'now':datetime.now(KST).isoformat(),
         'jobs':sorted(store.state['jobs'].values(),key=lambda x:x.get('updated_at',''),reverse=True)[:300],
         'history_count':len(store.history),'completed_count':sum(r.get('completed',False) for r in store.history),
@@ -83,7 +132,8 @@ def state():
 @app.post('/api/config',dependencies=[Depends(auth)])
 def config(body:dict):
     try:
-        c=validate_config(body['config']);store.save_config(c,body['revision']);return {'revision':revision(c)}
+        c=body['config'];prune_days(c['settings'],datetime.now(KST).date().isoformat())
+        c=validate_config(c);store.save_config(c,body['revision']);return {'revision':revision(c)}
     except (ValueError,KeyError,TypeError) as e:raise HTTPException(409,str(e))
     except Exception:raise HTTPException(503,'설정 저장 실패. 연결 상태를 확인하세요.')
 
@@ -121,22 +171,25 @@ def run():return engine.tick()
 def retry(tid:int):
     if str(tid) not in store.state['jobs']:raise HTTPException(404,'티켓 없음')
     if engine.run_lock.locked():raise HTTPException(409,'분석 완료 후 다시 시도하세요.')
+    w=store.state.get('writes',{}).get(str(tid))
+    if w and w['status']!='failed':raise HTTPException(409,'자동 접수 기록이 있어 재분석하지 않습니다. 미확인 건은 결과 확인을 먼저 하세요.')
+    if w:store.state['writes'].pop(str(tid))
     # A new baseline is allowed only after explicit administrator request.
     try:t=engine.z.ticket(tid)
     except Exception:raise HTTPException(503,'티켓 재조회 실패')
     store.set_job(tid,status='queued',attempts=0,source_updated_at=t['updated_at']);return {'ok':True}
 
-@app.post('/api/import',dependencies=[Depends(auth)])
-async def upload(file:UploadFile=File(...)):
+@app.post('/api/work-mapping/import',dependencies=[Depends(auth)])
+async def import_work_mapping(file:UploadFile=File(...)):
     data=await file.read(20*1024*1024+1)
     if len(data)>20*1024*1024:raise HTTPException(413,'20MB 이하 파일을 사용하세요.')
     try:
         with zipfile.ZipFile(BytesIO(data)) as z:
             if sum(x.file_size for x in z.infolist())>100*1024*1024:raise ValueError('압축 해제 용량 초과')
-        rows,report=import_xlsx(data)
-        if not rows:raise ValueError('티켓번호 열과 데이터를 찾을 수 없습니다.')
-        store.import_history(rows);return report
-    except Exception as e:raise HTTPException(400,'가져오기 실패: '+type(e).__name__)
+        rows=parse_workbook(data);known={p['name'] for p in store.config['settings'].get('parts',[])}
+        # Rows under parts outside the catalogue are ignored by decision (e.g. 수납/환자관리/배치).
+        return {'rows':[r for r in rows if r['part'] in known],'ignored':sorted({r['part'] for r in rows if r['part'] not in known})}
+    except Exception:raise HTTPException(400,'업무 엑셀을 읽지 못했습니다. 파일과 양식을 확인하세요.')
 
 @app.post('/api/simulate',dependencies=[Depends(auth)])
 def simulate(body:dict):
@@ -156,6 +209,12 @@ def simulate(body:dict):
         from .clients import IntegrationError
         detail=str(e) if isinstance(e,IntegrationError) else type(e).__name__
         raise HTTPException(503,'분석 실패: '+detail)
+    pis_name=str(body.get('pis_name') or '').strip()
+    if pis_name and pis_name not in active_names(c['settings']):raise HTTPException(400,'등록되지 않은 PIS 담당자입니다.')
+    if pis_name:result.update(pis_name=pis_name,pis_reason='테스트에서 직접 선택')
+    # Same rule as live tickets, but the assignment ledger is only read, never written.
+    else:engine.apply_pis(c,0,result,now.date().isoformat(),None,record=False)
+    result['operations_field']=expected_people(result,c)
     result['telegram_status']='not_requested'
     if body.get('send_telegram') is True:
         # Synthetic test only: no real ticket ID or Zendesk URL and no ticket mutation.
@@ -178,10 +237,11 @@ def analytics_dashboard(query:str=''):
         if query:
             q=query.strip().casefold()
             cases=[c for c in cases if q in str(c['ticket_id']) or q in (c.get('hospital') or '').casefold()]
-        cases.sort(key=lambda c:(not bool(c.get('decision')),bool(c.get('review')),-c['ticket_id']))
-        return {'summary':analytics.summary(),'cases':copy_data(cases[:250]),'total_matches':len(cases),
+        order={'part_error':0,'person_change':1,'match':2,'no_actual':3,'no_decision':4}
+        cases.sort(key=lambda c:(order.get(c['category'],5),-c['ticket_id']))
+        return {'summary':analytics.summary(),'cases':copy_data(cases[:250]),'total_matches':len(cases),'suggestions':analytics.suggestions(),
             'usage':copy_data(analytics.usage[-200:][::-1]),'prompts':copy_data(analytics.prompts[-30:][::-1]),
-            'active_prompt':'base-0.8-pre-review'+('+'+str(store.config['settings']['prompt_improvement']['id']) if store.config['settings'].get('prompt_improvement') else '')}
+            'active_prompt':'base-0.11-catalog'+('+'+str(store.config['settings']['prompt_improvement']['id']) if store.config['settings'].get('prompt_improvement') else '')}
 
 def copy_data(obj):
     import copy
@@ -194,16 +254,18 @@ async def analytics_import(file:UploadFile=File(...)):
     try:
         with zipfile.ZipFile(BytesIO(data)) as z:
             if sum(x.file_size for x in z.infolist())>100*1024*1024:raise ValueError('압축 해제 용량 초과')
-        names={a['name'] for a in store.config['agents'] if a.get('name')}
+        names={a['name'] for a in store.config['agents'] if a.get('name')}|{m['name'] for m in members(store.config['settings'])}
         rows,report=import_xlsx(data,names)
         if not rows:raise ValueError('티켓번호 열과 데이터를 찾을 수 없습니다.')
+        # One upload feeds both the similar-case search and the comparison with past auto-recommendations.
+        store.import_history(rows)
         return {'file':report,'comparison':analytics.import_cases(rows)}
     except Exception as e:raise HTTPException(400,'평가 파일 가져오기 실패: '+type(e).__name__)
 
-@app.post('/api/analytics/review/{tid}',dependencies=[Depends(auth)])
-def analytics_review(tid:int,body:dict):
-    try:return analytics.review_case(tid,body)
-    except (ValueError,TypeError,KeyError) as e:raise HTTPException(400,str(e))
+@app.post('/api/analytics/exclude/{tid}',dependencies=[Depends(auth)])
+def analytics_exclude(tid:int,body:dict):
+    try:return analytics.exclude(tid,body.get('excluded') is True)
+    except ValueError as e:raise HTTPException(400,str(e))
 
 @app.post('/api/analytics/propose',dependencies=[Depends(auth)])
 def analytics_propose():

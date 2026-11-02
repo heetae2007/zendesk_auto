@@ -1,12 +1,14 @@
-"""Recommendation-only worker. Durable queue, bounded passes, no ticket mutations."""
+"""Worker: durable queue, bounded passes. Ticket mutations only via the gated intake in write()."""
 import os, threading, copy
 from datetime import datetime,timedelta
-from .domain import (KST,operating,redact,rule_part,choose_agent,eligible_agents,allowed_agent,lexical_search,
-    is_pre_review_screen,apply_pre_review_rule,
+from .domain import (KST,operating,redact,lexical_search,is_pre_review_screen,apply_pre_review_rule,PRE_REVIEW_PARTS,
     urgent_candidate,similarity)
+from .catalog import parts,works,resolve,pis_rows
 from .store import stamp,revision
-from .clients import IntegrationError
+from .clients import IntegrationError,WriteRejected
 from .telegram_format import format_notification
+from .pis import on_call,pick_realtime,pick_backlog
+from .zendesk_write import live_enabled,build_update,applied
 
 class Engine:
     def __init__(self,store,zendesk,ai,telegram,analytics=None):
@@ -41,59 +43,39 @@ class Engine:
         text=redact(str(t.get('subject',''))+'\n'+str(t.get('description','')))
         hospital=self.hospital(t,c)
         urgent=urgent_candidate(text)
-        feedback=[{'summary':redact(f.get('summary','')),'corrected_part':f.get('part'),'reason':redact(f.get('reason',''))}
-            for f in c['feedback'] if f.get('verified') and f.get('kind')=='classification_error' and similarity(text,f.get('summary',''))>.03][:5]
         examples=lexical_search(text,self.store.history,hospital)
         improvement=copy.deepcopy(c['settings'].get('prompt_improvement') or {})
         improvement['examples']=[x for x in improvement.get('examples',[]) if str(x.get('ticket_id'))!=str(t['id'])]
-        prompt_version='base-0.8-pre-review'+('+'+str(improvement['id']) if improvement.get('id') else '')
+        prompt_version='base-0.11-catalog'+('+'+str(improvement['id']) if improvement.get('id') else '')
         result={'hospital':hospital,'summary':text[:2000],'part':'','agent_id':None,'agent_name':'',
             'confidence':None,'reason':'','similar_tickets':examples,'search_mode':'문자 유사도 검색',
             'urgent':bool(urgent),'related_ticket_ids':[],'config_revision':revision(c),'mode':'recommendation_only','prompt_version':prompt_version}
         if urgent:result.update(status='review',reason='긴급 의심: '+urgent);return result
-        rule=rule_part(c,text,hospital)
         if not c['settings'].get('ai_enabled',False):
             result.update(status='review',reason='AI 분석이 비활성화되어 있습니다. 설정을 확인하세요.');return result
         examples,search_mode=self.ai.search(text,self.store.history,hospital)
-        parts=sorted({p for a in c['agents'] if allowed_agent(a) for p in a['parts']})
-        by_id={}
-        for part in parts:
-            for a in eligible_agents(c,part,now.date().isoformat(),loads):
-                mapped=bool(a.get('zendesk_id') or (a.get('option_value') and c['settings'].get('mapping',{}).get('developer_field_id')))
-                count=loads.get(a['id'],0) if mapped and not simulation else None
-                entry=by_id.setdefault(a['id'],{'id':a['id'],'name':a['name'],'parts':[], 'unresolved_count':count})
-                entry['parts'].append(part)
-        available=list(by_id.values())
         department_field=c['settings'].get('mapping',{}).get('department_field_id')
         department=next((f.get('value') for f in t.get('custom_fields',[]) if department_field and str(f.get('id'))==str(department_field)),'')
-        out=self.ai.classify(text,parts,examples,feedback,rule,
+        # Claude decides parts and works only; people always come from the saved catalogue.
+        out=self.ai.classify(text,[p['name'] for p in parts(c)],examples,improvement,
             {'purpose':'simulation' if simulation else 'ticket','ticket_id':None if simulation else t['id'],'prompt_version':prompt_version,'department':redact(department)[:150]},
-            improvement,available,hospital)
+            hospital,work_items=[{'part':w['part'],'work':w['work']} for w in works(c)])
         assignments=out['recommended_assignments']
-        # Independently revalidate the returned roster; never trust model-supplied identities.
-        valid={a['id']:a for a in available}
-        seen_parts=set()
-        for item in assignments:
-            if item.get('part') not in parts or item['part'] in seen_parts:
-                raise IntegrationError('추천 파트 유효성 검증 실패')
-            seen_parts.add(item['part'])
-            for person in item['agents']:
-                a=valid.get(person['agent_id'])
-                if not a or a['name']!=person['agent_name'] or item['part'] not in a['parts'] or not allowed_agent(a):
-                    raise IntegrationError('추천 담당자 유효성 검증 실패')
         pre_review_screen=is_pre_review_screen(text)
-        if pre_review_screen:
-            assignments=apply_pre_review_rule(assignments,available)
+        if pre_review_screen:assignments=apply_pre_review_rule(assignments)
         reasons=list(out['review_reasons'])
+        reasons+=resolve(c,assignments,now.date().isoformat(),{} if simulation else loads)
+        if pre_review_screen:
+            for item in assignments:
+                if item['part'] in PRE_REVIEW_PARTS:item['agents']=item['agents'][:1]
         if not assignments:reasons.append('추천 파트가 없습니다.')
-        if rule and rule.get('conflict'):reasons.append('같은 우선순위의 배정 규칙이 충돌합니다.')
-        if rule and rule.get('part') and rule['part'] not in [a['part'] for a in assignments]:reasons.append('AI 추천과 배정 규칙이 다릅니다.')
         if not hospital:reasons.append('병원 필드 매핑이 필요합니다.')
         if any(not a['agents'] for a in assignments):reasons.append('담당자가 확인되지 않은 파트가 있습니다.')
         if any(a['role']=='UNDETERMINED' for a in assignments):reasons.append('주담당과 협업 담당 구분이 필요합니다.')
         if out['urgent']:reasons.append(out['urgent_reason'] or '긴급 문의 검토가 필요합니다.')
         if out['confidence']<c['settings']['min_confidence']:reasons.append('추천 신뢰도가 기준보다 낮습니다.')
         if out['requires_manual_review']:reasons.append('AI가 검토를 요청했습니다.')
+        reasons=list(dict.fromkeys(reasons))
         all_people=[person for assignment in assignments for person in assignment['agents']]
         # Preserve legacy scalar fields only when a single selection is unambiguous.
         single=len(assignments)==1 and len(all_people)==1
@@ -115,6 +97,80 @@ class Engine:
         if any(not next((a for a in c['agents'] if a['id']==p['agent_id']),{}).get('zendesk_id') and not next((a for a in c['agents'] if a['id']==p['agent_id']),{}).get('option_value') for p in all_people):
             result['mapping_warning']='담당자의 Zendesk ID/선택값이 미설정입니다.'
         return result
+
+    def pick_pis(self,c,tid,result,day,batch=None,record=True):
+        """Exactly one confirmed on-call PIS, or None. One ledger row per ticket, so no double counting."""
+        ledger=self.store.state.setdefault('pis',{});key=str(tid)
+        eligible={m['name'] for m in on_call(c['settings'],day)}
+        prior=ledger.get(key)
+        if prior and prior.get('date')==day and prior.get('name') in eligible and (batch is None or prior['name'] not in batch):
+            if batch is not None:batch.add(prior['name'])
+            return prior['name'],prior.get('reason','')
+        if batch is not None:
+            name,reason=pick_backlog(pis_rows(c,result.get('recommended_assignments',[])),eligible,batch)
+            if not name:
+                # Every ticket needs a PIS: once primary/backup are used up, continue by weight among today's on-call.
+                name,why=pick_realtime(c['settings'],day,{k:v for k,v in ledger.items() if k!=key})
+                reason=reason+' → 비중 순서 배정' if name else why
+            reason='밀린 티켓 묶음: '+reason
+            if name:batch.add(name)
+        else:
+            name,reason=pick_realtime(c['settings'],day,{k:v for k,v in ledger.items() if k!=key})
+        if record:
+            if name:ledger[key]={'date':day,'name':name,'reason':reason,'at':stamp()}
+            else:ledger.pop(key,None)
+        return name,reason
+
+    def apply_pis(self,c,tid,result,day,batch=None,record=True):
+        name,reason=self.pick_pis(c,tid,result,day,batch,record)
+        result.update(pis_name=name or '',pis_reason=reason)
+        if not name:
+            result['status']='review';result['review_reasons']=list(result.get('review_reasons',[]))+['PIS 담당자 미배정: '+reason]
+            result['reason']='PIS 담당자 미배정: '+reason+' / '+str(result.get('reason',''))
+        return result
+
+    def write(self,c,tid):
+        """Single gated Zendesk intake. Each ticket is attempted at most once unless an operator resets a definite failure."""
+        writes=self.store.state.setdefault('writes',{});key=str(tid)
+        if key in writes:return
+        j=self.store.state['jobs'][key]
+        try:
+            current=self.z.ticket(tid)
+            payload=build_update(j,c,current,self.default_form_id(current))
+        except ValueError as e:
+            self.store.set_job(tid,status='review',write_status='blocked',reason='자동 접수 보류: '+str(e));return
+        except Exception:
+            self.store.set_job(tid,status='review',write_status='blocked',reason='자동 접수 보류: 접수 직전 티켓 재조회 실패');return
+        writes[key]={'status':'pending','at':stamp(),'payload':payload};self.store.save_state()
+        try:
+            self.z.update_ticket(tid,payload)
+            writes[key].update(status='done',done_at=stamp());self.store.set_job(tid,write_status='done')
+        except WriteRejected as e:
+            writes[key].update(status='failed',error=str(e))
+            self.store.set_job(tid,status='review',write_status='failed',reason='자동 접수 실패(변경 없음): '+str(e))
+        except Exception as e:
+            # Timeouts may still have applied the update and posted the public comment. Never resend.
+            detail=str(e) if isinstance(e,IntegrationError) else type(e).__name__
+            writes[key].update(status='unknown',error=detail)
+            self.store.set_job(tid,status='review',write_status='unknown',reason='자동 접수 결과 미확인: Zendesk에서 확인 후 결과 확인 버튼을 누르세요. '+detail)
+        self.store.save_state()
+
+    def default_form_id(self,ticket):
+        # Only needed when the new ticket already carries a form other than the target one.
+        target=str(self.store.config['settings'].get('mapping',{}).get('form_id') or '')
+        if ticket.get('ticket_form_id') in (None,'') or str(ticket['ticket_form_id'])==target:return None
+        return next((f['id'] for f in self.z.forms() if f.get('default')),None)
+
+    def verify_write(self,tid):
+        w=self.store.state.get('writes',{}).get(str(tid))
+        if not w or w['status'] not in ('unknown','pending'):raise ValueError('확인할 미확정 접수 기록이 없습니다.')
+        result=applied(self.z.ticket(tid),w['payload'])
+        if result is True:
+            w.update(status='done',verified_at=stamp());self.store.set_job(tid,write_status='done',reason='자동 접수 반영 확인')
+        elif result is False:
+            w.update(status='failed',verified_at=stamp());self.store.set_job(tid,write_status='failed',reason='자동 접수가 반영되지 않았음을 확인했습니다. 재분석할 수 있습니다.')
+        self.store.save_state()
+        return w['status']
 
     def loads(self,c,unresolved):
         result={a['id']:0 for a in c['agents']};field=c['settings'].get('mapping',{}).get('developer_field_id')
@@ -159,10 +215,15 @@ class Engine:
             unresolved=self.z.unresolved();loads=self.loads(c,unresolved)
             pending=[j for j in self.store.state['jobs'].values() if j['status'] in ('queued','deferred','retry')]
             pending.sort(key=lambda j:(not j.get('urgent',False),j.get('created_at') or ''))
+            threshold=c['settings'].get('pis_backlog_threshold',0)
+            # Backlog rule only when an administrator configured a threshold; one batch = one pass (max 10).
+            batch=set() if threshold and len(pending)>=threshold else None
+            day=now.date().isoformat()
             for j in pending[:10]:
                 tid=j['ticket_id']
                 if j.get('attempts',0)>=3:
-                    self.store.set_job(tid,status='review',reason='AI 분석 재시도 3회 초과');self.notify(c,self.store.state['jobs'][str(tid)]);continue
+                    failed=self.apply_pis(c,tid,{'status':'review','reason':'AI 분석 재시도 3회 초과'},day,batch)
+                    self.store.set_job(tid,**failed);self.notify(c,self.store.state['jobs'][str(tid)]);continue
                 try:
                     current=self.z.ticket(tid)
                     if current['status']!='new':self.store.set_job(tid,status='skipped',reason='현재 신규 상태가 아닙니다.');continue
@@ -174,10 +235,12 @@ class Engine:
                         fresh=self.store.refresh()
                         if revision(fresh)!=revision(c):
                             self.store.set_job(tid,status='queued',reason='설정 변경으로 다음 주기에 재분석');continue
+                        self.apply_pis(c,tid,result,day,batch)
                         self.store.set_job(tid,**result)
                         if self.analytics:self.analytics.add_decision(self.store.state['jobs'][str(tid)])
                     selected={p['agent_id'] for a in result.get('recommended_assignments',[]) for p in a['agents']} if result['status']=='recommended' else set()
                     for agent_id in selected:loads[agent_id]=loads.get(agent_id,0)+1
+                    if result['status']=='recommended' and live_enabled(c):self.write(c,tid)
                     self.notify(c,self.store.state['jobs'][str(tid)])
                 except Exception as e:
                     detail=str(e) if isinstance(e,IntegrationError) else type(e).__name__

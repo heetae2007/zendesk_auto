@@ -1,7 +1,7 @@
 import copy,io,threading
 from datetime import datetime,date
 import pytest
-from app.domain import defaults,operating,KST,choose_agent,rule_part,redact,validate_config
+from app.domain import defaults,operating,KST,redact,validate_config
 from app.store import Store,revision
 from app.engine import Engine
 from app.importer import import_xlsx
@@ -9,11 +9,15 @@ from app.importer import import_xlsx
 NOW=datetime(2026,11,2,10,0,tzinfo=KST)
 
 def config():
-    c=defaults();c['settings']['enabled']=True;c['settings']['mapping']={'hospital_field_id':10}
-    c['agents'][0]['parts']=['보험'];c['agents'][1]['parts']=['보험']
-    c['rules']=[{'id':'r1','part':'보험','hospital':'예손병원','keywords':['DRG'],'priority':10,'active':True}]
-    c['roster']=[{'date':'2026-11-02','part':'보험','primary':['agent-1'],'backup':['agent-2']}]
+    c=defaults();c['settings']['enabled']=True;c['settings']['ai_enabled']=True;c['settings']['mapping']={'hospital_field_id':10}
+    # Catalogue: 보험 defaults to 김종오 (agent-1) with 이선주 (agent-2) as backup.
+    c['settings']['parts']=[part('보험','김종오','이선주'),part('원무','김구현','신승용')]
+    c['settings']['work_mappings']=[]
+    c['settings']['pis_days']=[{'date':'2026-11-02','members':[{'name':'이혜경','slot':'call1','absent':False}]}]
     return c
+
+def part(name,dev='',backup='',pis='',pis_backup=''):
+    return {'name':name,'active':True,'option_value':'','developer':dev,'developer_backup':backup,'pis':pis,'pis_backup':pis_backup}
 
 class Z:
     def __init__(self):self.t={'id':1,'status':'new','updated_at':'2026-11-02T00:00:00Z','created_at':'2026-11-02T00:00:00Z','subject':'DRG 수납 오류','description':'','custom_fields':[{'id':10,'value':'예손병원'}]};self.fail=False;self.change=False
@@ -25,9 +29,15 @@ class Z:
         if self.change:t['updated_at']='2026-11-02T00:01:00Z'
         return t
     def unresolved(self):return [self.t.copy()]
+def ai_out(part='보험',works=None):
+    return {'ticket_id':1,'hospital':'예손병원','summary':'DRG 수납 오류 확인 요청','issue_type':'BUG',
+        'recommended_assignments':[{'part':part,'part_id':None,'role':'PRIMARY','responsibility':'확인',
+            'supporting_ticket_ids':[],'works':list(works or [])}],
+        'confidence':.95,'urgent':False,'urgent_reason':'','requires_manual_review':False,'review_reasons':[],'reason':'업무 근거'}
 class A:
+    def __init__(self):self.out=ai_out();self.calls=[]
     def search(self,*args):return [],'fake'
-    def classify(self,*args):return {'part':'보험','confidence':.95,'reason':'업무 근거','urgent':False,'manual_review':False}
+    def classify(self,*args,**kw):self.calls.append((args,kw));return __import__('copy').deepcopy(self.out)
 class T:
     def __init__(self):self.n=0;self.fail=False
     def send(self,text):
@@ -54,23 +64,49 @@ def test_holiday_and_override():
     c['calendar'][0]['closed']=True
     assert not operating(c,NOW,[])[0]
 
-def test_absent_backup():
-    c=config();c['agents'][0]['active']=False
-    assert choose_agent(c,'보험','2026-11-02',{})[0]['id']=='agent-2'
+def people(c,assignments,loads=None):
+    from app.catalog import resolve
+    rows=copy.deepcopy(assignments);reasons=resolve(c,rows,'2026-11-02',loads or {})
+    return [[p['agent_name'] for p in r['agents']] for r in rows],reasons
 
-def test_no_backup():
-    c=config();c['agents'][0]['active']=False;c['roster'][0]['backup']=[]
-    assert choose_agent(c,'보험','2026-11-02',{})[0] is None
+def test_catalogue_primary_then_backup():
+    c=config();a=[{'part':'보험','works':[]}]
+    assert people(c,a)[0]==[['김종오']]
+    c['agents'][0]['active']=False;assert people(c,a)[0]==[['이선주']]
+    c['settings']['absences']=[{'id':'x','agent_id':'agent-2','start':'2026-11-01','end':'2026-11-03'}]
+    names,reasons=people(c,a);assert names==[[]] and '배정 가능한' in reasons[0]
 
-def test_workload_and_scope():
-    c=config()
-    assert choose_agent(c,'보험','2026-11-02',{'agent-1':20})[0]['id']=='agent-2'
-    c['agents'][1]['parts']=[]
-    assert choose_agent(c,'보험','2026-11-02',{'agent-1':20})[0] is None
+def test_catalogue_workload_moves_to_backup():
+    assert people(config(),[{'part':'보험','works':[]}],{'agent-1':20})[0]==[['이선주']]
 
-def test_rule_conflict():
-    c=config();c['rules'].append({**c['rules'][0],'id':'r2','part':'원무'})
-    assert rule_part(c,'DRG','예손병원')['conflict']
+def test_changing_work_owner_changes_routing_immediately():
+    c=config();c['settings']['work_mappings']=[{'part':'보험','work':'심사','developer':'채희태','developer_backup':'이정기','active':True}]
+    a=[{'part':'보험','works':['심사']}]
+    assert people(c,a)[0]==[['채희태']]
+    c['settings']['work_mappings'][0]['developer']='이정기'
+    assert people(c,a)[0]==[['이정기']]
+
+def test_multiple_works_give_multiple_developers_and_missing_work_is_review():
+    c=config();c['settings']['work_mappings']=[{'part':'보험','work':'심사','developer':'채희태'},{'part':'보험','work':'청구','developer':'이정기'}]
+    assert people(c,[{'part':'보험','works':['심사','청구']}])[0]==[['채희태','이정기']]
+    names,reasons=people(c,[{'part':'보험','works':[]}])
+    assert names==[['김종오']] and '세부업무가 확인되지' in reasons[0]
+
+def test_excluded_names_never_resolved():
+    c=config();c['settings']['parts'][0]['developer']='윤새라'
+    assert people(c,[{'part':'보험','works':[]}])[0]==[['이선주']]
+
+def test_migration_from_agent_parts_and_ignored_parts():
+    from app.catalog import normalize
+    c=defaults();c['agents'][0]['parts']=['보험'];c['agents'][1]['parts']=['원무'];c['agents'][2]['parts']=['원무']
+    c['settings']['part_options']={'보험':'tag_ins'}
+    c['settings']['work_mappings']=[{'part':'수납','work':'x'},{'part':'보험','work':'심사'}]
+    c['rules']=[{'id':'r'}];normalize(c)
+    p={x['name']:x for x in c['settings']['parts']}
+    assert p['보험']['developer']=='김종오' and p['보험']['option_value']=='tag_ins'
+    assert p['원무']['developer']==''  # two owners: order unknown, never guessed
+    assert [w['part'] for w in c['settings']['work_mappings']]==['보험'] and c['rules']==[]
+    assert normalize(copy.deepcopy(c))==c
 
 def test_pii_redaction():
     s=redact('주민번호 900101-1234567 전화 010-1234-5678 이메일 a@example.com 환자명: 홍길동')
@@ -94,8 +130,8 @@ def test_non_new_skipped(system):
     s,z,a,t,e=system;e.scan(s.config);z.t['status']='open';e.tick(NOW)
     assert s.state['jobs']['1']['status']=='skipped'
 
-def test_no_examples_requires_review(system):
-    s,z,a,t,e=system;s.config['rules']=[];e.tick(NOW)
+def test_ai_disabled_requires_review(system):
+    s,z,a,t,e=system;s.config['settings']['ai_enabled']=False;e.tick(NOW)
     assert s.state['jobs']['1']['status']=='review'
 
 def test_urgent(system):
@@ -107,16 +143,18 @@ def test_api_failure(system):
     assert not s.state['jobs']
 
 def test_ai_failure_retries(system):
-    s,z,a,t,e=system;s.config['rules']=[];s.config['settings']['ai_enabled']=True
-    def fail(*a):raise TimeoutError()
+    s,z,a,t,e=system
+    def fail(*a,**k):raise TimeoutError()
     a.classify=fail
     for _ in range(4):e.tick(NOW)
     assert s.state['jobs']['1']['status']=='review'
 
-def test_invalid_ai_part(system):
-    s,z,a,t,e=system;s.config['rules']=[];s.config['settings']['ai_enabled']=True
-    a.classify=lambda *args:{'part':'없는파트','confidence':.99,'reason':'wrong','urgent':False,'manual_review':False}
-    e.tick(NOW);assert s.state['jobs']['1']['status']=='review'
+def test_pre_review_screen_one_per_part(system):
+    s,z,a,t,e=system;z.t['subject']='사전심사 화면 금액 불일치'
+    s.config['settings']['work_mappings']=[{'part':'보험','work':'심사','developer':'채희태'},{'part':'보험','work':'청구','developer':'이정기'}]
+    a.out=ai_out(works=['심사','청구']);e.tick(NOW)
+    rows={r['part']:[p['agent_name'] for p in r['agents']] for r in s.state['jobs']['1']['recommended_assignments']}
+    assert rows=={'보험':['채희태'],'원무':['김구현']}
 
 def test_telegram_failure_does_not_reprocess(system):
     s,z,a,t,e=system;s.config['settings']['notify']=True;t.fail=True;e.tick(NOW);e.tick(NOW)
@@ -147,7 +185,7 @@ def test_import_deduplicates():
     assert rows[0]['participants']==['김종오']
 
 def test_duplicate_detection_same_hospital(system):
-    s,z,a,t,e=system;other={**z.t,'id':2};r=e.analyze(z.t,s.config,{},[other],NOW)
+    s,z,a,t,e=system;other={**z.t,'id':2,'created_at':NOW.isoformat()};r=e.analyze(z.t,s.config,{},[other],NOW)
     assert r['related_ticket_ids']==[2]
     other['custom_fields']=[{'id':10,'value':'다른병원'}]
     assert e.analyze(z.t,s.config,{},[other],NOW)['related_ticket_ids']==[]
@@ -155,6 +193,35 @@ def test_duplicate_detection_same_hospital(system):
 def test_no_pis_fields():
     assert all('pis' not in k.lower() for a in defaults()['agents'] for k in a)
 
-def test_scope_conflict_validation():
-    c=config();c['roster'].append(c['roster'][0].copy())
+def test_catalogue_validation():
+    c=config();c['settings']['parts'].append(part('보험'))
     with pytest.raises(ValueError):validate_config(c)
+    c=config();c['settings']['work_mappings']=[{'part':'없는파트','work':'x'}]
+    with pytest.raises(ValueError):validate_config(c)
+
+class FakeSheets:
+    def __init__(self,config=None,fail=False):self.config=config;self.fail=fail;self.saved=[]
+    def load_config(self):
+        if self.fail:raise RuntimeError('offline')
+        return copy.deepcopy(self.config)
+    def save_config(self,c):self.config=copy.deepcopy(c);self.saved.append(c)
+    def write_rows(self,*a):pass
+
+def test_settings_survive_restart_local(tmp_path):
+    s=Store(tmp_path);c=config();c['settings']['work_mappings']=[{'part':'보험','work':'심사'}]
+    s.save_config(c,revision(s.config))
+    again=Store(tmp_path);assert again.config==c and again.ready
+
+def test_settings_survive_restart_sheets(tmp_path):
+    sheets=FakeSheets(config());s=Store(tmp_path,sheets)
+    assert s.try_refresh() and s.config==config()
+    c=copy.deepcopy(s.config);c['settings']['pis_backlog_threshold']=3;s.save_config(c,revision(s.config))
+    # Restart: the saved copy is shown immediately, then confirmed from Sheets.
+    again=Store(tmp_path,sheets);assert again.config==c and not again.ready
+    assert again.try_refresh() and again.ready and again.config==c
+
+def test_sheets_offline_after_restart_keeps_last_saved(tmp_path):
+    s=Store(tmp_path,FakeSheets(config()));s.try_refresh()
+    offline=Store(tmp_path,FakeSheets(fail=True))
+    assert not offline.try_refresh() and offline.config==config() and not offline.ready
+    with pytest.raises(RuntimeError):offline.save_config(config(),revision(offline.config))
