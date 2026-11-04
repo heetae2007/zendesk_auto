@@ -1,14 +1,14 @@
-import os,json,threading,fcntl,zipfile
+import os,copy,threading,fcntl,zipfile
 from pathlib import Path
 from io import BytesIO
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime,timedelta
 from fastapi import FastAPI,Depends,HTTPException,Request,UploadFile,File
 from fastapi.responses import FileResponse,RedirectResponse,JSONResponse
 from fastapi.staticfiles import StaticFiles
-from .domain import validate_config,operating,KST,defaults,redact
+from .domain import validate_config,operating,KST,redact
 from .store import Store,Sheets,revision
-from .clients import Zendesk,AI,Telegram,IntegrationError,MODELS,EFFORTS,env_model,model_for
+from .clients import Zendesk,AI,Telegram,MODELS,EFFORTS,env_model,model_for,sniff,error_detail
 from . import runtime
 from .engine import Engine
 from .importer import import_xlsx
@@ -56,11 +56,9 @@ async def lifespan(app):
 
 app=FastAPI(title='Zendesk 접수 운영실',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
 
-IMAGE_TYPES={b'\x89PNG\r\n\x1a\n':'image/png',b'\xff\xd8\xff':'image/jpeg'}
-
 def image_type(data):
-    if data[:4]==b'RIFF' and data[8:12]==b'WEBP':return 'image/webp'
-    return next((t for sig,t in IMAGE_TYPES.items() if data.startswith(sig)),None)
+    kind=sniff(data)
+    return kind if kind in ('image/png','image/jpeg','image/webp') else None
 
 @app.post('/api/pis/schedule/read',dependencies=[Depends(auth)])
 async def pis_schedule_read(file:UploadFile=File(...),year:int=0):
@@ -73,9 +71,7 @@ async def pis_schedule_read(file:UploadFile=File(...),year:int=0):
     if not 2020<=year<=2100:raise HTTPException(400,'연도 범위 오류')
     names=active_names(store.config['settings'])
     try:out=engine.ai.read_schedule(data,kind,names,store.config['settings'])
-    except Exception as e:
-        from .clients import IntegrationError
-        raise HTTPException(503,'배정표 분석 실패: '+(str(e) if isinstance(e,IntegrationError) else type(e).__name__))
+    except Exception as e:raise HTTPException(503,'배정표 분석 실패: '+error_detail(e))
     return normalize_schedule(out,year,names)
 
 @app.get('/api/zendesk/preflight',dependencies=[Depends(auth)])
@@ -179,7 +175,6 @@ def logout():
 
 def daily_counts(jobs,today,days=14):
     """Tickets per Zendesk creation date (KST) for the last two weeks, zero days included."""
-    from datetime import date,timedelta
     rows={(today-timedelta(days=i)).isoformat():{'total':0,'recommended':0,'review':0,'deferred':0,'other':0,'written':0} for i in range(days)}
     for j in jobs:
         try:d=datetime.fromisoformat(str(j.get('created_at')).replace('Z','+00:00')).astimezone(KST).date().isoformat()
@@ -280,7 +275,6 @@ async def import_work_mapping(file:UploadFile=File(...)):
 
 @app.post('/api/simulate',dependencies=[Depends(auth)])
 def simulate(body:dict):
-    import copy
     text=redact(body.get('text',''))
     if not text.strip():raise HTTPException(400,'문의 내용을 입력하세요.')
     c=copy.deepcopy(store.config)
@@ -292,10 +286,7 @@ def simulate(body:dict):
     allowed,why=operating(c,now)
     if not allowed:return {'status':'deferred','reason':why}
     try:result=engine.analyze({'id':0,'subject':text,'description':'','custom_fields':[{'id':'simulation','value':body.get('hospital','')}]},c,{},[],now,True)
-    except Exception as e:
-        from .clients import IntegrationError
-        detail=str(e) if isinstance(e,IntegrationError) else type(e).__name__
-        raise HTTPException(503,'분석 실패: '+detail)
+    except Exception as e:raise HTTPException(503,'분석 실패: '+error_detail(e))
     pis_name=str(body.get('pis_name') or '').strip()
     if pis_name and pis_name not in active_names(c['settings']):raise HTTPException(400,'등록되지 않은 PIS 담당자입니다.')
     if pis_name:result.update(pis_name=pis_name,pis_reason='테스트에서 직접 선택')
@@ -326,13 +317,9 @@ def analytics_dashboard(query:str=''):
             cases=[c for c in cases if q in str(c['ticket_id']) or q in (c.get('hospital') or '').casefold()]
         order={'part_error':0,'person_change':1,'match':2,'no_actual':3,'no_decision':4}
         cases.sort(key=lambda c:(order.get(c['category'],5),-c['ticket_id']))
-        return {'summary':analytics.summary(),'cases':copy_data(cases[:250]),'total_matches':len(cases),'suggestions':analytics.suggestions(),
-            'usage':copy_data(analytics.usage[-200:][::-1]),'prompts':copy_data(analytics.prompts[-30:][::-1]),
+        return {'summary':analytics.summary(),'cases':copy.deepcopy(cases[:250]),'total_matches':len(cases),'suggestions':analytics.suggestions(),
+            'usage':copy.deepcopy(analytics.usage[-200:][::-1]),'prompts':copy.deepcopy(analytics.prompts[-30:][::-1]),
             'active_prompt':'base-0.11-catalog'+('+'+str(store.config['settings']['prompt_improvement']['id']) if store.config['settings'].get('prompt_improvement') else '')}
-
-def copy_data(obj):
-    import copy
-    return copy.deepcopy(obj)
 
 @app.post('/api/analytics/import',dependencies=[Depends(auth)])
 async def analytics_import(file:UploadFile=File(...)):
@@ -370,7 +357,7 @@ def analytics_apply(body:dict):
 @app.post('/api/analytics/reset',dependencies=[Depends(auth)])
 def analytics_reset(body:dict):
     try:
-        c=copy_data(store.config);c['settings'].pop('prompt_improvement',None)
+        c=copy.deepcopy(store.config);c['settings'].pop('prompt_improvement',None)
         store.save_config(c,str(body['revision']));return {'ok':True}
     except (ValueError,KeyError) as e:raise HTTPException(409,str(e))
     except Exception:raise HTTPException(503,'설정 저장 실패')

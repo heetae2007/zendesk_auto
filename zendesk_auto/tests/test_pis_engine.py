@@ -5,7 +5,7 @@ from app.store import Store
 from app.engine import Engine
 from app.domain import validate_config
 from app.pis import normalize_schedule, pick_backlog
-from app.clients import AI, IntegrationError, WriteRejected, WriteUnknown
+from app.clients import AI, IntegrationError
 
 DAY='2026-11-02'
 MAPS=[{'part':'보험','work':'심사','developer':'김종오','developer_backup':'이선주','pis':'노주영','pis_backup':'이혜경'},

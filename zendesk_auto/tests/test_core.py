@@ -1,4 +1,4 @@
-import copy,io,threading
+import copy,io
 from datetime import datetime,date
 import pytest
 from app.domain import defaults,operating,KST,redact,validate_config,lexical_search

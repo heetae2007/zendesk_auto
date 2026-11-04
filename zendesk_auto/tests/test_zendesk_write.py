@@ -174,3 +174,15 @@ def test_tick_writes_review_only_with_switch(live):
     assert s.state['jobs']['1']['status']=='review' and not z.updates
     s.state['jobs'].pop('1');s.config['settings']['live_include_review']=True;e.tick(NOW)
     assert s.state['jobs']['1']['status']=='review' and len(z.updates)==1 and s.state['jobs']['1']['write_status']=='done'
+
+def test_idle_tick_skips_the_unresolved_search(live):
+    s,z,e=live();calls=[];real=z.unresolved;z.unresolved=lambda:calls.append(1) or real()
+    e.tick(NOW);assert len(calls)==1 and s.state['jobs']['1']['status']=='recommended'   # a ticket was waiting
+    e.tick(NOW);assert len(calls)==1                                                     # nothing waiting now
+
+def test_hospital_lookup_failure_is_remembered_briefly(live):
+    s,z,e=live();s.config['settings']['mapping']['hospital_field_id']='10';s.config['settings']['live_test_hospitals']=['본원_1']
+    calls=[]
+    def fail(path,params=None):calls.append(path);raise RuntimeError('down')
+    z.get=fail;job={'ticket_id':5,'hospital_tag':'본원'}
+    assert [e.live_target(s.config,job) for _ in range(5)]==[False]*5 and len(calls)==1

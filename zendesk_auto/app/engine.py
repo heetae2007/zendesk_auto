@@ -1,11 +1,11 @@
 """Worker: durable queue, bounded passes. Ticket mutations only via the gated intake in write()."""
-import os, threading, copy, time
+import threading, copy, time
 from datetime import datetime,timedelta
 from .domain import (KST,operating,redact,lexical_search,is_pre_review_screen,apply_pre_review_rule,PRE_REVIEW_PARTS,
     urgent_candidate,similarity,hospital_name,allowed_agent)
 from .catalog import parts,works,resolve,pis_rows
 from .store import stamp,revision
-from .clients import IntegrationError,WriteRejected,model_for
+from .clients import IntegrationError,WriteRejected,model_for,error_detail
 from .telegram_format import format_notification
 from .pis import on_call,pick_realtime,pick_backlog
 from .zendesk_write import live_enabled,build_update,applied,test_tickets,test_hospitals,test_mode,hospital_tags
@@ -15,7 +15,7 @@ class Engine:
         self.store=store;self.z=zendesk;self.ai=ai;self.telegram=telegram
         self.analytics=analytics
         self.run_lock=threading.Lock()
-        self._tags=(None,0,set())
+        self._tags=(None,0,set())   # (key, valid until, tags)
 
     def hospital(self,t,c):
         field=c['settings'].get('mapping',{}).get('hospital_field_id')
@@ -23,14 +23,14 @@ class Engine:
         return hospital_name(raw)
 
     def test_hospital_tags(self,c):
-        """Hospital tags for the test hospitals, read from Zendesk and kept for 10 minutes. Empty on any error."""
+        """Hospital tags for the test hospitals, read from Zendesk and kept for 10 minutes. After an error the empty answer is kept for 1 minute."""
         names=test_hospitals(c);field=c['settings'].get('mapping',{}).get('hospital_field_id')
         if not names or not str(field or '').isdigit():return set()
         key=(str(field),tuple(names))
-        if self._tags[0]==key and time.time()-self._tags[1]<600:return self._tags[2]
-        try:tags=hospital_tags(self.z.get(f'/ticket_fields/{int(field)}.json').get('ticket_field'),names)
-        except Exception:return set()   # unknown: no ticket qualifies
-        self._tags=(key,time.time(),tags);return tags
+        if self._tags[0]==key and time.time()<self._tags[1]:return self._tags[2]
+        try:tags,keep=hospital_tags(self.z.get(f'/ticket_fields/{int(field)}.json').get('ticket_field'),names),600
+        except Exception:tags,keep=set(),60   # unknown: no ticket qualifies
+        self._tags=(key,time.time()+keep,tags);return tags
 
     def live_target(self,c,job):
         """Live intake for this ticket. In test mode only listed tickets or tickets of a test hospital change."""
@@ -185,7 +185,7 @@ class Engine:
             self.store.set_job(tid,status='review',write_status='failed',reason='자동 접수 실패(변경 없음): '+str(e))
         except Exception as e:
             # Timeouts may still have applied the update and posted the public comment. Never resend.
-            detail=str(e) if isinstance(e,IntegrationError) else type(e).__name__
+            detail=error_detail(e)
             writes[key].update(status='unknown',error=detail)
             self.store.set_job(tid,status='review',write_status='unknown',reason='자동 접수 결과 미확인: Zendesk에서 확인 후 결과 확인 버튼을 누르세요. '+detail)
         self.store.save_state()
@@ -247,9 +247,10 @@ class Engine:
                 for j in list(self.store.state['jobs'].values()):
                     if j['status'] in ('queued','deferred'):self.store.set_job(j['ticket_id'],status='deferred',reason=reason)
                 return {'skipped':reason}
-            unresolved=self.z.unresolved();loads=self.loads(c,unresolved)
             pending=[j for j in self.store.state['jobs'].values() if j['status'] in ('queued','deferred','retry')]
             pending.sort(key=lambda j:(not j.get('urgent',False),j.get('created_at') or ''))
+            # The unresolved-ticket search only feeds workload counts, so it is skipped when nothing is waiting.
+            unresolved=self.z.unresolved() if pending else [];loads=self.loads(c,unresolved)
             threshold=c['settings'].get('pis_backlog_threshold',0)
             # Backlog rule only when an administrator configured a threshold; one batch = one pass (max 10).
             batch=set() if threshold and len(pending)>=threshold else None
@@ -279,8 +280,7 @@ class Engine:
                     if writable and self.live_target(c,self.store.state['jobs'][str(tid)]):self.write(c,tid)
                     self.notify(c,self.store.state['jobs'][str(tid)])
                 except Exception as e:
-                    detail=str(e) if isinstance(e,IntegrationError) else type(e).__name__
-                    self.store.set_job(tid,status='retry',attempts=j.get('attempts',0)+1,reason='분석·연동 오류: '+detail)
+                    self.store.set_job(tid,status='retry',attempts=j.get('attempts',0)+1,reason='분석·연동 오류: '+error_detail(e))
             self.store.mirror()
             self.store.state['last_error']=None
             return {'processed':min(10,len(pending))}

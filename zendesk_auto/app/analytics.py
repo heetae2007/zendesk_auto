@@ -6,7 +6,6 @@ from .domain import redact
 from .pis import members
 
 BASE_VERSION='base-0.4'
-CATEGORIES={'match':'일치','part_error':'파트 오분류','person_change':'담당자 변경','no_actual':'실제 담당 정보 없음','no_decision':'자동 추천 이력 없음'}
 
 def category(case):
     """A recommendation matches only when its developers are exactly the people who handled the ticket."""

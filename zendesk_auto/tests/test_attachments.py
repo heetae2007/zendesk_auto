@@ -49,6 +49,8 @@ def test_sniff_ignores_declared_type():
     assert clients.sniff(PNG)=='image/png' and clients.sniff(b'%PDF-1.7')=='application/pdf' and clients.sniff(b'<html>') is None
 
 def test_credentials_never_sent_to_external_host(monkeypatch):
+    # Own credentials, not whatever the real .env holds.
+    monkeypatch.setenv('ZENDESK_API_TOKEN','fake-test-only');monkeypatch.setenv('ZENDESK_OAUTH_CLIENT_ID','');monkeypatch.setenv('ZENDESK_OAUTH_CLIENT_SECRET','')
     seen=[]
     def handler(req):
         seen.append((req.url.host,req.headers.get('authorization')))

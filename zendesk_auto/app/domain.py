@@ -1,8 +1,7 @@
 """Pure routing policy. No network or Zendesk writes in this module."""
-import re, unicodedata, json
+import re, unicodedata, json, copy
 from datetime import datetime, date, time
 from zoneinfo import ZoneInfo
-from collections import Counter
 
 KST = ZoneInfo('Asia/Seoul')
 EXCLUDED_AGENT_NAMES = frozenset({'윤세라','윤새라'})
@@ -123,16 +122,12 @@ PRE_REVIEW_PARTS=('원무','보험')
 
 def apply_pre_review_rule(assignments):
     """Ensure one 원무 and one 보험 row; people are filled from the catalogue and trimmed to one each by the caller."""
-    output=copy_assignments(assignments)
+    output=copy.deepcopy(assignments)
     for part in PRE_REVIEW_PARTS:
         if not any(item['part']==part for item in output):
             output.append({'part':part,'part_id':None,'role':'UNDETERMINED',
                 'responsibility':'사전심사 화면과 관련된 '+part+' 업무 확인','works':[],'supporting_ticket_ids':[]})
     return output
-
-def copy_assignments(assignments):
-    import copy
-    return copy.deepcopy(assignments)
 
 # Zendesk hospital values that differ from the name used in past tickets. Only pairs confirmed by the operations team.
 HOSPITAL_ALIASES={'부산부민':'부산부민병원'}

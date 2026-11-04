@@ -1,5 +1,4 @@
 """Part → work → developer/PIS catalogue. The single source for who handles what."""
-import copy
 from .domain import allowed_agent
 from .pis import split_names
 

@@ -1,4 +1,5 @@
 import os, re, json, base64
+import httpx
 from urllib.parse import urlparse, urljoin
 from .domain import redact, lexical_search
 from .prompt_multi import SYSTEM_PROMPT
@@ -8,6 +9,10 @@ HISTORY_CHARS=400  # per past-case summary sent to Claude; the bulk of input tok
 ATTACH_LIMIT=3;ATTACH_BYTES=5*1024*1024  # per ticket / per file
 
 class IntegrationError(Exception): pass
+
+def error_detail(e):
+    """Message safe to show: our own integration errors as written, anything else by class name only."""
+    return str(e) if isinstance(e,IntegrationError) else type(e).__name__
 
 def sniff(data):
     """Media type from the file's own bytes; Zendesk's content_type is not trusted."""
@@ -25,16 +30,10 @@ class WriteUnknown(IntegrationError):
 class Zendesk:
     """Reads tickets; update_ticket is called only by the gated intake path."""
     def __init__(self):
-        self.configure()
-
-    def configure(self):
-        """(Re)build the HTTP client. Credentials are looked up per request, so a new login applies at once."""
-        import httpx
         from . import runtime
-        old=getattr(self,'http',None)
+        # Credentials are looked up per request, so a new login applies at once.
         self.base=f"https://{runtime.subdomain()}.zendesk.com/api/v2"
         self.http=httpx.Client(auth=runtime.zendesk_auth(),timeout=25)
-        if old:old.close()
 
     @property
     def ready(self):
@@ -90,7 +89,6 @@ class Zendesk:
 
     def download(self,url):
         """Credentials go only to our own Zendesk host; redirects are followed by hand so they never leak."""
-        import httpx
         own=urlparse(self.base).netloc
         for _ in range(4):
             u=urlparse(url)
@@ -111,7 +109,6 @@ class Zendesk:
         raise IntegrationError('첨부 리다이렉트 과다')
 
     def update_ticket(self,tid,payload):
-        import httpx
         try:r=self.http.put(f'{self.base}/tickets/{int(tid)}.json',json=payload)
         except httpx.TimeoutException:raise WriteUnknown('Zendesk 응답 시간 초과') from None
         except httpx.RequestError:raise WriteUnknown('Zendesk 연결 오류') from None
@@ -172,7 +169,6 @@ class AI:
         model=model_for((context or {}).get('purpose',''),settings)
         key=os.getenv('ANTHROPIC_API_KEY','').strip()
         if not model or not key:raise IntegrationError('Claude 모델/API 키 미설정')
-        import httpx
         payload={'model':model,'max_tokens':max_tokens,'system':system,
             'messages':[{'role':'user','content':content}],
             'output_config':{'format':{'type':'json_schema','schema':schema}}}
@@ -294,7 +290,6 @@ class AI:
 
 class Telegram:
     def send(self,text):
-        import httpx
         token=os.getenv('TELEGRAM_BOT_TOKEN');chat=os.getenv('TELEGRAM_CHAT_ID')
         if not token or not chat:raise IntegrationError('Telegram 미설정')
         try:

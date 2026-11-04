@@ -1,4 +1,4 @@
-from collections import defaultdict,Counter
+from collections import defaultdict
 from io import BytesIO
 import re
 from .domain import redact,NAMES
