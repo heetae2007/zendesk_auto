@@ -16,7 +16,7 @@ from .analytics import Analytics
 from .telegram_format import format_notification
 from .work_mapping import parse_workbook
 from .pis import members,active_names,on_call,counts as pis_counts,normalize_schedule,prune_days
-from .zendesk_write import live_enabled,preflight,suggest,expected_people
+from .zendesk_write import live_enabled,preflight,suggest,expected_people,test_mode
 from .catalog import unknown_people
 
 def load_env():
@@ -85,6 +85,21 @@ def zendesk_preflight():
     except Exception:raise HTTPException(503,'Zendesk 설정 조회 실패. API 권한을 확인하세요.')
     return {'check':preflight(store.config,meta),'options':suggest(store.config,meta)}
 
+@app.post('/api/jobs/{tid}/test-write',dependencies=[Depends(auth)])
+def test_write(tid:int):
+    """Operator-triggered intake for a listed test ticket, also when its recommendation needs review."""
+    c=store.config
+    if not live_enabled(c):raise HTTPException(400,'실제 접수가 꺼져 있습니다.')
+    job=store.state['jobs'].get(str(tid))
+    if not job or job.get('status') not in ('recommended','review'):raise HTTPException(400,'분석이 끝난 티켓만 접수할 수 있습니다.')
+    if not test_mode(c) or not engine.live_target(c,job):raise HTTPException(400,'테스트 티켓 번호나 테스트 병원에 해당하는 티켓이 아닙니다.')
+    if str(tid) in store.state.get('writes',{}):raise HTTPException(409,'이미 접수를 시도한 티켓입니다. 결과 확인 후 재분석하세요.')
+    if not engine.run_lock.acquire(blocking=False):raise HTTPException(409,'분석 완료 후 다시 시도하세요.')
+    try:engine.write(c,tid,allow_review=True);store.save_state()
+    finally:engine.run_lock.release()
+    j=store.state['jobs'][str(tid)]
+    return {'write_status':j.get('write_status'),'reason':j.get('reason','') if j.get('write_status')!='done' else ''}
+
 @app.post('/api/jobs/{tid}/write-verify',dependencies=[Depends(auth)])
 def write_verify(tid:int):
     if not engine.run_lock.acquire(blocking=False):raise HTTPException(409,'분석 완료 후 다시 시도하세요.')
@@ -119,16 +134,21 @@ def auth_info():
     return {'mode':info['mode'],'subdomain':info['subdomain'],'current':info['user']['name'] if info['user'] else None,
         'intake_paused':runtime.mode()=='oauth' and not info['user']}
 
-def session_cookie(response,sid):
-    response.set_cookie(runtime.COOKIE,sid,max_age=runtime.SESSION_SECONDS,httponly=True,samesite='lax',secure=bool((runtime.oauth() or {}).get('secure')))
+def origin(request):return f'{request.url.scheme}://{request.url.netloc}'
+
+def session_cookie(response,sid,request):
+    response.set_cookie(runtime.COOKIE,sid,max_age=runtime.SESSION_SECONDS,httponly=True,samesite='lax',secure=request.url.scheme=='https')
     return response
 
 @app.get('/auth/login')
-def oauth_start():
-    if not runtime.oauth():return RedirectResponse('/login',302)
-    url,state=runtime.start()
+def oauth_start(request:Request):
+    o=runtime.oauth()
+    if not o:return RedirectResponse('/login',302)
+    # The state cookie must be set on the same address Zendesk sends the browser back to.
+    if origin(request) not in o['bases']:return RedirectResponse(runtime.site()+'/auth/login',302)
+    url,state=runtime.start(origin(request))
     r=RedirectResponse(url,302)
-    r.set_cookie(runtime.STATE_COOKIE,state,max_age=runtime.STATE_SECONDS,httponly=True,samesite='lax',secure=runtime.oauth()['secure'],path='/auth')
+    r.set_cookie(runtime.STATE_COOKIE,state,max_age=runtime.STATE_SECONDS,httponly=True,samesite='lax',secure=request.url.scheme=='https',path='/auth')
     return r
 
 @app.get('/auth/callback')
@@ -139,15 +159,15 @@ def oauth_callback(request:Request,code:str='',state:str='',error:str=''):
     try:sid,_=runtime.finish(code,state,request.cookies.get(runtime.STATE_COOKIE))
     except runtime.LoginError as e:return RedirectResponse('/login?e='+(str(e) if str(e) in ('expired','role') else 'failed'),302)
     finally:engine.run_lock.release()
-    r=session_cookie(RedirectResponse('/',302),sid);r.delete_cookie(runtime.STATE_COOKIE,path='/auth')
+    r=session_cookie(RedirectResponse('/',302),sid,request);r.delete_cookie(runtime.STATE_COOKIE,path='/auth')
     return r
 
 @app.post('/auth/password')
-def password_login(body:dict):
+def password_login(body:dict,request:Request):
     if runtime.oauth():raise HTTPException(400,'Zendesk 계정으로 로그인하세요.')
     try:sid=runtime.password_login(body.get('password'))
     except runtime.LoginError as e:raise HTTPException(401,str(e))
-    return session_cookie(JSONResponse({'ok':True}),sid)
+    return session_cookie(JSONResponse({'ok':True}),sid,request)
 
 @app.post('/auth/logout',dependencies=[Depends(auth)])
 def logout():
@@ -175,7 +195,11 @@ def state():
     store.try_refresh()
     c=store.config;allowed,why=operating(c)
     day=datetime.now(KST).date().isoformat();live=live_enabled(c)
-    return {'config':c,'revision':revision(c),'mode':'실제 접수' if live else '추천 전용',
+    tests=test_mode(c)
+    # Tickets the '테스트 접수' button may be offered for (analysed, not yet attempted).
+    test_ids=[int(j['ticket_id']) for j in store.state['jobs'].values() if live and tests and j.get('status') in ('recommended','review')
+        and str(j['ticket_id']) not in store.state.get('writes',{}) and engine.live_target(c,j)]
+    return {'config':c,'revision':revision(c),'mode':('실제 접수 (테스트 대상만)' if tests else '실제 접수') if live else '추천 전용','test_write_ids':test_ids,
         'live':{'enabled':live,'env_allows':os.getenv('ALLOW_LIVE_WRITES','').strip().lower()=='true','setting':c['settings'].get('live_writes') is True},
         'pis_today':{'date':day,'on_call':on_call(c['settings'],day),'counts':pis_counts(store.state.get('pis',{}),day)},
         'pis_members':members(c['settings']),'catalog_warnings':unknown_people(c),

@@ -119,3 +119,58 @@ def test_other_form_is_left_alone():
 def test_engine_blocks_other_form(live):
     s,z,e=live();z.t['ticket_form_id']=555;z.forms=lambda:[{'id':1,'default':True}];e.tick(NOW)
     assert not z.updates and '다른 양식' in s.state['jobs']['1']['reason']
+
+def test_listed_test_tickets_are_the_only_live_targets(live):
+    s,z,e=live();s.config['settings']['live_test_tickets']=[999];e.tick(NOW)
+    # Ticket 1 is recommended, but it is not a test ticket: nothing is written.
+    assert not z.updates and s.state['jobs']['1']['status']=='recommended' and '1' not in s.state.get('writes',{})
+    s.state['jobs'].pop('1');s.config['settings']['live_test_tickets']=[1];e.tick(NOW)
+    assert len(z.updates)==1 and s.state['writes']['1']['status']=='done'
+
+def test_review_is_written_only_by_operator_on_test_ticket():
+    with pytest.raises(ValueError,match='검토'):build_update(job(status='review'),live_config(),TICKET)
+    assert build_update(job(status='review'),live_config(),TICKET,allow_review=True)['ticket']['custom_status_id']==222
+    # Every other safety check still applies.
+    with pytest.raises(ValueError,match='신규'):build_update(job(status='review'),live_config(),{**TICKET,'status':'open'},allow_review=True)
+
+def test_test_ticket_list_validated():
+    from app.domain import validate_config
+    for bad in ([0],['12'],[True],list(range(1,22))):
+        c=live_config();c['settings']['live_test_tickets']=bad
+        with pytest.raises(ValueError,match='테스트 티켓'):validate_config(c)
+
+def test_test_hospital_matches_the_stored_tag(live):
+    from app.zendesk_write import hospital_tags
+    field={'custom_field_options':[{'name':'본원_1','value':'본원'},{'name':'예손병원','value':'예손병원'}]}
+    assert hospital_tags(field,['본원_1'])=={'본원'} and hospital_tags(field,['없는병원'])==set()
+    s,z,e=live();s.config['settings']['mapping']['hospital_field_id']='10'
+    s.config['settings']['live_test_hospitals']=['본원_1']
+    z.get=lambda path,params=None:{'ticket_field':field}
+    e.tick(NOW)                                   # LiveZ ticket hospital is 예손병원: recommendation only
+    assert not z.updates and s.state['jobs']['1']['hospital_tag']=='예손병원'
+    s.state['jobs'].pop('1');z.t['custom_fields']=[{'id':10,'value':'본원'}];e._tags=(None,0,set());e.tick(NOW)
+    assert len(z.updates)==1 and s.state['writes']['1']['status']=='done'
+
+def test_test_hospital_lookup_failure_writes_nothing(live):
+    s,z,e=live();s.config['settings']['mapping']['hospital_field_id']='10'
+    s.config['settings']['live_test_hospitals']=['본원_1'];z.t['custom_fields']=[{'id':10,'value':'본원'}]
+    def fail(path,params=None):raise RuntimeError('down')
+    z.get=fail;e.tick(NOW)
+    assert not z.updates and s.state['jobs']['1']['status']=='recommended'
+
+def test_review_written_when_switch_on_but_never_urgent():
+    c=live_config()
+    with pytest.raises(ValueError,match='검토'):build_update(job(status='review'),c,TICKET)
+    c['settings']['live_include_review']=True
+    assert build_update(job(status='review'),c,TICKET)['ticket']['custom_status_id']==222
+    # No developer found: registered with the PIS only.
+    p=build_update(job(status='review',recommended_assignments=[{**ai_out()['recommended_assignments'][0],'agents':[]}]),c,TICKET)['ticket']
+    assert {'id':DEV_FIELD,'value':['pis_lee']} in p['custom_fields']
+    with pytest.raises(ValueError,match='긴급'):build_update(job(status='review',urgent=True),c,TICKET)
+    with pytest.raises(ValueError,match='개발 담당자'):build_update(job(recommended_assignments=[{**ai_out()['recommended_assignments'][0],'agents':[]}]),live_config(),TICKET)
+
+def test_tick_writes_review_only_with_switch(live):
+    s,z,e=live();s.config['settings']['min_confidence']=1.0;e.tick(NOW)
+    assert s.state['jobs']['1']['status']=='review' and not z.updates
+    s.state['jobs'].pop('1');s.config['settings']['live_include_review']=True;e.tick(NOW)
+    assert s.state['jobs']['1']['status']=='review' and len(z.updates)==1 and s.state['jobs']['1']['write_status']=='done'

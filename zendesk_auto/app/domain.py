@@ -88,11 +88,19 @@ def validate_config(c):
         if (w['part'], w['work']) in works: raise ValueError(f"세부업무 기준 중복: {w['part']}/{w['work']}")
         works.add((w['part'], w['work']))
         if not isinstance(w.get('active', True), bool): raise ValueError('세부업무 사용 여부 오류')
+        if not isinstance(w.get('description', ''), str) or len(w.get('description', '')) > 200: raise ValueError('세부업무 판단 기준은 200자 이하로 입력하세요.')
     from .pis import validate_settings
     from .catalog import validate as validate_catalog
     validate_settings(s); validate_catalog(c)
     if not isinstance(s.get('live_writes', False), bool): raise ValueError('실제 접수 설정 오류')
     if not isinstance(s.get('read_attachments', False), bool): raise ValueError('첨부 확인 설정 오류')
+    if not isinstance(s.get('live_include_review', False), bool): raise ValueError('검토 필요 접수 설정 오류')
+    tests = s.get('live_test_tickets', [])
+    if not isinstance(tests, list) or len(tests) > 20 or not all(isinstance(x, int) and not isinstance(x, bool) and x > 0 for x in tests):
+        raise ValueError('테스트 티켓 번호는 20개까지, 양의 정수만 입력하세요.')
+    hospitals = s.get('live_test_hospitals', [])
+    if not isinstance(hospitals, list) or len(hospitals) > 20 or not all(isinstance(x, str) and x.strip() and len(x) <= 100 for x in hospitals):
+        raise ValueError('테스트 병원명은 20개까지 입력하세요.')
     from .clients import validate_models
     validate_models(s)
     # Google Sheets stores settings as one JSON cell (50,000 characters maximum).

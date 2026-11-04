@@ -1,5 +1,5 @@
 """Worker: durable queue, bounded passes. Ticket mutations only via the gated intake in write()."""
-import os, threading, copy
+import os, threading, copy, time
 from datetime import datetime,timedelta
 from .domain import (KST,operating,redact,lexical_search,is_pre_review_screen,apply_pre_review_rule,PRE_REVIEW_PARTS,
     urgent_candidate,similarity,hospital_name,allowed_agent)
@@ -8,18 +8,36 @@ from .store import stamp,revision
 from .clients import IntegrationError,WriteRejected,model_for
 from .telegram_format import format_notification
 from .pis import on_call,pick_realtime,pick_backlog
-from .zendesk_write import live_enabled,build_update,applied
+from .zendesk_write import live_enabled,build_update,applied,test_tickets,test_hospitals,test_mode,hospital_tags
 
 class Engine:
     def __init__(self,store,zendesk,ai,telegram,analytics=None):
         self.store=store;self.z=zendesk;self.ai=ai;self.telegram=telegram
         self.analytics=analytics
         self.run_lock=threading.Lock()
+        self._tags=(None,0,set())
 
     def hospital(self,t,c):
         field=c['settings'].get('mapping',{}).get('hospital_field_id')
         raw=next((x['value'] for x in t.get('custom_fields',[]) if str(x['id'])==str(field)),None)
         return hospital_name(raw)
+
+    def test_hospital_tags(self,c):
+        """Hospital tags for the test hospitals, read from Zendesk and kept for 10 minutes. Empty on any error."""
+        names=test_hospitals(c);field=c['settings'].get('mapping',{}).get('hospital_field_id')
+        if not names or not str(field or '').isdigit():return set()
+        key=(str(field),tuple(names))
+        if self._tags[0]==key and time.time()-self._tags[1]<600:return self._tags[2]
+        try:tags=hospital_tags(self.z.get(f'/ticket_fields/{int(field)}.json').get('ticket_field'),names)
+        except Exception:return set()   # unknown: no ticket qualifies
+        self._tags=(key,time.time(),tags);return tags
+
+    def live_target(self,c,job):
+        """Live intake for this ticket. In test mode only listed tickets or tickets of a test hospital change."""
+        if not live_enabled(c):return False
+        if not test_mode(c):return True
+        if int(job['ticket_id']) in test_tickets(c):return True
+        return job.get('hospital_tag') not in (None,'') and str(job['hospital_tag']) in self.test_hospital_tags(c)
 
     def scan(self,c):
         cursor=self.store.state['scan'].get('next')
@@ -45,7 +63,9 @@ class Engine:
         improvement['examples']=[x for x in improvement.get('examples',[]) if str(x.get('ticket_id'))!=str(t['id'])]
         # The model is part of the version so the analytics tab compares models like prompt versions.
         prompt_version='base-0.13-handler@'+model_for('ticket',c['settings'])+('+'+str(improvement['id']) if improvement.get('id') else '')
-        result={'hospital':hospital,'summary':text[:2000],'part':'','agent_id':None,'agent_name':'',
+        field=c['settings'].get('mapping',{}).get('hospital_field_id')
+        tag=next((x['value'] for x in t.get('custom_fields',[]) if str(x['id'])==str(field)),None)
+        result={'hospital':hospital,'hospital_tag':tag if isinstance(tag,str) else None,'summary':text[:2000],'part':'','agent_id':None,'agent_name':'',
             'confidence':None,'reason':'','similar_tickets':examples,'search_mode':'문자 유사도 검색',
             'urgent':bool(urgent),'related_ticket_ids':[],'config_revision':revision(c),'mode':'recommendation_only','prompt_version':prompt_version}
         if urgent:result.update(status='review',reason='긴급 의심: '+urgent);return result
@@ -56,7 +76,7 @@ class Engine:
         department=next((f.get('value') for f in t.get('custom_fields',[]) if department_field and str(f.get('id'))==str(department_field)),'')
         # Claude decides parts and works only; people always come from the saved catalogue.
         context={'purpose':'simulation' if simulation else 'ticket','ticket_id':None if simulation else t['id'],'prompt_version':prompt_version,'department':redact(department)[:150],'settings':c['settings']}
-        work_items=[{'part':w['part'],'work':w['work']} for w in works(c)]
+        work_items=[{'part':w['part'],'work':w['work'],**({'description':w['description']} if w.get('description') else {})} for w in works(c)]
         # Past handlers are limited to developers on the roster; PIS and others are not sent or used.
         devs={a['name'] for a in c['agents'] if a.get('name') and allowed_agent(a)}
         examples=[{**r,'participants':[n for n in r.get('participants',[]) if n in devs]} for r in examples]
@@ -144,14 +164,14 @@ class Engine:
             result['reason']='PIS 담당자 미배정: '+reason+' / '+str(result.get('reason',''))
         return result
 
-    def write(self,c,tid):
+    def write(self,c,tid,allow_review=False):
         """Single gated Zendesk intake. Each ticket is attempted at most once unless an operator resets a definite failure."""
         writes=self.store.state.setdefault('writes',{});key=str(tid)
         if key in writes:return
         j=self.store.state['jobs'][key]
         try:
             current=self.z.ticket(tid)
-            payload=build_update(j,c,current,self.default_form_id(current))
+            payload=build_update(j,c,current,self.default_form_id(current),allow_review)
         except ValueError as e:
             self.store.set_job(tid,status='review',write_status='blocked',reason='자동 접수 보류: '+str(e));return
         except Exception:
@@ -255,7 +275,8 @@ class Engine:
                         if self.analytics:self.analytics.add_decision(self.store.state['jobs'][str(tid)])
                     selected={p['agent_id'] for a in result.get('recommended_assignments',[]) for p in a['agents']} if result['status']=='recommended' else set()
                     for agent_id in selected:loads[agent_id]=loads.get(agent_id,0)+1
-                    if result['status']=='recommended' and live_enabled(c):self.write(c,tid)
+                    writable=result['status']=='recommended' or (result['status']=='review' and c['settings'].get('live_include_review') is True)
+                    if writable and self.live_target(c,self.store.state['jobs'][str(tid)]):self.write(c,tid)
                     self.notify(c,self.store.state['jobs'][str(tid)])
                 except Exception as e:
                     detail=str(e) if isinstance(e,IntegrationError) else type(e).__name__

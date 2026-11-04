@@ -7,6 +7,21 @@ def live_enabled(c):
     # Both the server env switch and the web setting are required.
     return os.getenv('ALLOW_LIVE_WRITES','').strip().lower()=='true' and c['settings'].get('live_writes') is True
 
+def test_tickets(c):
+    return [int(x) for x in c['settings'].get('live_test_tickets') or []]
+
+def test_hospitals(c):
+    return [str(x) for x in c['settings'].get('live_test_hospitals') or []]
+
+def test_mode(c):
+    """Test tickets or test hospitals are set: only those tickets are ever changed."""
+    return bool(test_tickets(c) or test_hospitals(c))
+
+def hospital_tags(field, names):
+    """Tags of the hospital dropdown options named (or tagged) as listed. '본원_1' is shown, '본원' is stored."""
+    wanted=set(names)
+    return {str(o.get('value')) for o in (field or {}).get('custom_field_options') or [] if o.get('name') in wanted or o.get('value') in wanted}
+
 def field(metadata, field_id):
     return next((f for f in (metadata or {}).get('fields',[]) if str(f.get('id'))==str(field_id)),None)
 
@@ -95,13 +110,16 @@ def expected_people(job, c):
 def current_value(ticket, field_id):
     return next((f.get('value') for f in ticket.get('custom_fields',[]) if str(f.get('id'))==str(field_id)),None)
 
-def build_update(job, c, ticket, default_form_id=None):
+def build_update(job, c, ticket, default_form_id=None, allow_review=False):
     """Raise ValueError (→ human review) unless every value is confirmed.
     A form other than the target or the account default means someone chose it: leave the ticket alone."""
     m=c['settings'].get('mapping',{});tid=int(ticket['id'])
     for key in ('form_id','custom_status_id','part_field_id','developer_field_id'):
         if not str(m.get(key) or '').strip().isdigit():raise ValueError('Zendesk 양식·상태·필드 ID 설정이 필요합니다.')
-    if job.get('status')!='recommended':raise ValueError('검토가 필요한 추천은 자동 접수하지 않습니다.')
+    # Review results are written when the operator turned on '검토 필요도 접수' or pressed '테스트 접수'. Every other check still applies.
+    review=job.get('status')=='review' and (allow_review or c['settings'].get('live_include_review') is True)
+    if job.get('status')!='recommended' and not review:raise ValueError('검토가 필요한 추천은 자동 접수하지 않습니다.')
+    if job.get('urgent'):raise ValueError('긴급 의심 티켓은 자동 접수하지 않습니다.')
     if ticket.get('status')!='new':raise ValueError('현재 신규 상태가 아닙니다.')
     if ticket.get('updated_at')!=job.get('source_updated_at'):raise ValueError('최초 감지 이후 변경된 티켓입니다.')
     form=ticket.get('ticket_form_id')
@@ -111,7 +129,8 @@ def build_update(job, c, ticket, default_form_id=None):
     people=expected_people(job,c)
     pis=[p for p in people if p['role']=='PIS'];devs=[p for p in people if p['role']=='개발']
     if len(pis)!=1:raise ValueError('PIS 담당자가 정확히 1명이 아닙니다.')
-    if not devs:raise ValueError('개발 담당자가 없습니다.')
+    # A review result may lack a developer: it is registered with the PIS alone and a person adds the developer.
+    if not devs and not review:raise ValueError('개발 담당자가 없습니다.')
     missing=[p['name'] for p in people if not p['value']]
     if missing:raise ValueError('운영팀 담당자 선택값 미설정: '+', '.join(missing))
     values=[p['value'] for p in people]

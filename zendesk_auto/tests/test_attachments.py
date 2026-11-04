@@ -82,3 +82,11 @@ def test_past_handlers_are_sent_with_similar_cases(monkeypatch):
     monkeypatch.setattr(AI,'_post',lambda self,system,content,schema,context,**k:sent.update(content=content) or json.loads(json.dumps(out)))
     AI(None).classify('문의',['보험'],[{'ticket_id':9,'summary':'청구 문의','parts':['보험'],'participants':['이정기']}],None,{},'병원',work_items=[])
     assert json.loads(sent['content'][-1]['text'])['historical_cases'][0]['handled_by']==['이정기']
+
+def test_work_descriptions_go_to_the_cached_catalogue(monkeypatch):
+    sent={}
+    out=ai_out();out['ticket_id']=0;out['hospital']='병원'
+    monkeypatch.setattr(AI,'_post',lambda self,system,content,schema,context,**k:sent.update(content=content) or json.loads(json.dumps(out)))
+    AI(None).classify('문의',['보험'],[],None,{},'병원',work_items=[{'part':'보험','work':'심사','description':'심사조정·삭감 조회'},{'part':'보험','work':'청구'}])
+    stable=json.loads(sent['content'][0]['text'])
+    assert sent['content'][0]['cache_control'] and stable['work_items']==[{'part':'보험','work':'심사','description':'심사조정·삭감 조회'},{'part':'보험','work':'청구'}]

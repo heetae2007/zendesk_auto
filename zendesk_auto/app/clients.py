@@ -252,7 +252,7 @@ class AI:
         data={'ticket':{'ticket_id':(context or {}).get('ticket_id') or 0,'hospital':redact(hospital)[:150], 'request_department':redact((context or {}).get('department',''))[:150], 'text':redact(text),
                 'attached_files':len(attachments)},
             'available_parts':parts,
-            'work_items':[{'part':w['part'],'work':w['work']} for w in (work_items or [])],
+            'work_items':[{'part':w['part'],'work':w['work'],**({'description':w['description']} if w.get('description') else {})} for w in (work_items or [])],
             'historical_cases':[{'ticket_id':r['ticket_id'],'summary':redact(r['summary'])[:HISTORY_CHARS],'parts':r['parts'],
                 'handled_by':r.get('participants',[])} for r in examples],
             'reviewed_corrections':(improvement or {}).get('examples',[])}

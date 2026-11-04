@@ -133,6 +133,7 @@ def test_zendesk_login_is_the_intake_account(monkeypatch,tmp_path):
         c=TestClient(app,base_url='https://easyedge.example')
         r=c.get('/auth/login',follow_redirects=False);url=urlparse(r.headers['location']);q=parse_qs(url.query)
         assert url.netloc=='edgennext.zendesk.com' and q['redirect_uri']==['https://easyedge.example/auth/callback'] and q['code_challenge_method']==['S256']
+        assert q['scope']==['read tickets:write'] and 'scope=read%20tickets%3Awrite' in url.query
         return c,c.get(f"/auth/callback?code={code}&state={q['state'][0]}",follow_redirects=False)
     assert not engine.z.ready
     # A state that did not start in this browser is refused.
@@ -186,3 +187,40 @@ def test_daily_counts_by_kst_creation_date():
     assert [r['date'] for r in rows]==['2026-11-04','2026-11-03','2026-11-02']
     assert rows[0]|{}=={'date':'2026-11-04','total':2,'recommended':0,'review':1,'deferred':0,'other':1,'written':0}
     assert rows[1]['recommended']==1 and rows[1]['written']==1 and rows[2]['total']==0
+
+def test_oauth_uses_the_address_the_browser_opened(monkeypatch,tmp_path):
+    from urllib.parse import urlparse,parse_qs
+    from app import runtime
+    monkeypatch.setenv('SECRETS_DIR',str(tmp_path))
+    monkeypatch.setenv('ZENDESK_OAUTH_CLIENT_ID','easyedge');monkeypatch.setenv('ZENDESK_OAUTH_CLIENT_SECRET','client-secret')
+    monkeypatch.setenv('PUBLIC_URL','http://localhost:8080, http://192.168.0.10:8080')
+    seen=[]
+    monkeypatch.setattr(runtime,'_token_request',lambda p:seen.append(p['redirect_uri']) or {'access_token':'tok-1','refresh_token':'r','expires_in':3600})
+    monkeypatch.setattr(runtime,'_me',lambda t:{'id':1,'name':'김상담','email':'','role':'agent'})
+    monkeypatch.setattr(runtime,'_revoke',lambda t:None)
+    c=TestClient(app,base_url='http://192.168.0.10:8080')
+    r=c.get('/auth/login',follow_redirects=False);q=parse_qs(urlparse(r.headers['location']).query)
+    assert q['redirect_uri']==['http://192.168.0.10:8080/auth/callback']
+    assert c.get(f"/auth/callback?code=c&state={q['state'][0]}",follow_redirects=False).headers['location']=='/'
+    assert seen==['http://192.168.0.10:8080/auth/callback']
+    # An address that is not configured is sent to the first configured one before login starts.
+    r=TestClient(app,base_url='http://127.0.0.1:8080').get('/auth/login',follow_redirects=False)
+    assert r.headers['location']=='http://localhost:8080/auth/login'
+
+def test_test_write_endpoint_guards(monkeypatch):
+    from app.main import engine,store
+    client=logged_in();c=store.config
+    assert client.post('/api/jobs/5/test-write',headers=H2).status_code==400          # live off
+    c['settings']['live_writes']=True;monkeypatch.setenv('ALLOW_LIVE_WRITES','true')
+    try:
+        c['settings']['live_test_tickets']=[7]
+        store.state['jobs']['5']={'ticket_id':5,'status':'review'};store.state['jobs']['7']={'ticket_id':7,'status':'review'}
+        assert '테스트 티켓 번호나' in client.post('/api/jobs/5/test-write',headers=H2).json()['detail']
+        assert client.get('/api/state').json()['test_write_ids']==[7]
+        called=[]
+        monkeypatch.setattr(engine,'write',lambda cfg,tid,allow_review=False:called.append((tid,allow_review)) or store.set_job(tid,write_status='done'))
+        r=client.post('/api/jobs/7/test-write',headers=H2)
+        assert r.status_code==200 and r.json()['write_status']=='done' and called==[(7,True)]
+        assert client.get('/api/state').json()['mode']=='실제 접수 (테스트 대상만)'
+    finally:
+        c['settings']['live_writes']=False;c['settings'].pop('live_test_tickets',None);store.state['jobs'].pop('7',None);store.state['jobs'].pop('5',None)

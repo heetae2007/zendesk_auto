@@ -9,7 +9,7 @@ SYSTEM_PROMPT = r'''당신은 ezCaretech의 Zendesk 고객문의를 읽고, 문�
 ## 2. 입력 데이터
 - ticket: 티켓번호, 제목·본문, 병원, 요청부서
 - available_parts: 선택할 수 있는 파트 목록
-- work_items: 파트별 세부업무 목록 (part, work)
+- work_items: 파트별 세부업무 목록 (part, work, 있으면 description). description은 그 세부업무로 분류할 문의의 키워드·화면명으로, 세부업무를 고를 때 판단 기준으로 씁니다.
 - historical_cases: 비슷한 과거 티켓의 요약, 실제 관련 파트, 실제로 처리한 개발 담당자(handled_by)
 - reviewed_corrections: 과거에 자동 분류한 파트가 실제와 달랐던 확인 사례 (요약, 잘못 분류한 파트, 실제 파트)
 입력에 없는 정보는 추측하여 만들어내지 않습니다.

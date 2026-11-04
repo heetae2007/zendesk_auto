@@ -9,7 +9,7 @@ Without an OAuth client in .env, the old ADMIN_PASSWORD login and ZENDESK_API_TO
 """
 import base64, hashlib, json, os, secrets, threading, time
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 import httpx
 from .clients import IntegrationError
 
@@ -19,6 +19,13 @@ SESSION_SECONDS=12*3600         # browser cookie only; the Zendesk login stays u
 STATE_SECONDS=600
 COOKIE='easyedge_session';STATE_COOKIE='easyedge_oauth'
 ROLES=('agent','admin')
+# Each must also be allowed on the Zendesk OAuth client, or Zendesk answers "Invalid scope".
+#   read           every lookup. Ticket search (new tickets, unresolved workload) answers 403 to the
+#                  granular read scopes (tickets:read, users:read ...), so the broad read is needed.
+#   tickets:write  the intake update and public reply; nothing else is ever written
+SCOPES='read tickets:write'
+
+def scopes():return os.getenv('ZENDESK_OAUTH_SCOPE','').strip() or SCOPES
 _lock=threading.RLock();_pending={};_failures=[]
 
 class LoginError(IntegrationError):pass
@@ -34,8 +41,15 @@ def oauth():
     """OAuth client from .env, or None while it is not set up yet."""
     cid=os.getenv('ZENDESK_OAUTH_CLIENT_ID','').strip();secret=os.getenv('ZENDESK_OAUTH_CLIENT_SECRET','').strip()
     if not cid or not secret:return None
-    base=os.getenv('PUBLIC_URL','http://127.0.0.1:8080').strip().rstrip('/')
-    return {'client_id':cid,'client_secret':secret,'redirect_uri':base+'/auth/callback','secure':base.startswith('https://')}
+    # Several addresses (comma separated) when people open the site by different names, e.g. localhost and the office IP.
+    # Each needs its own redirect URL (address + /auth/callback) registered on the Zendesk OAuth client.
+    bases=[b.strip().rstrip('/') for b in os.getenv('PUBLIC_URL','http://127.0.0.1:8080').split(',') if b.strip()]
+    return {'client_id':cid,'client_secret':secret,'bases':bases,'redirect_uri':bases[0]+'/auth/callback','secure':bases[0].startswith('https://')}
+
+def site(base=None):
+    """The configured address matching the one the browser used, else the first one."""
+    o=oauth();base=str(base or '').rstrip('/')
+    return base if o and base in o['bases'] else (o['bases'][0] if o else '')
 
 def mode():return 'oauth' if oauth() else 'password'
 
@@ -103,7 +117,7 @@ def password_login(password):
 
 # Zendesk OAuth (authorization code with PKCE)
 
-def start():
+def start(base=None):
     """Zendesk authorization URL and the state value the browser must bring back."""
     o=oauth()
     if not o:raise LoginError('Zendesk OAuth 클라이언트가 설정되지 않았습니다.')
@@ -112,9 +126,11 @@ def start():
     with _lock:
         now=time.time()
         for k in [k for k,v in _pending.items() if v[1]<now]:_pending.pop(k)
-        _pending[state]=(verifier,now+STATE_SECONDS)
-    query=urlencode({'response_type':'code','client_id':o['client_id'],'redirect_uri':o['redirect_uri'],'scope':'read write',
-        'state':state,'code_challenge':challenge,'code_challenge_method':'S256'})
+        redirect=site(base)+'/auth/callback'
+        _pending[state]=(verifier,now+STATE_SECONDS,redirect)
+    # Spaces as %20: Zendesk rejects 'read+write' with "Invalid scope".
+    query=urlencode({'response_type':'code','client_id':o['client_id'],'redirect_uri':redirect,'scope':scopes(),
+        'state':state,'code_challenge':challenge,'code_challenge_method':'S256'},quote_via=quote)
     return f'https://{subdomain()}.zendesk.com/oauth/authorizations/new?{query}',state
 
 def finish(code,state,browser_state):
@@ -124,8 +140,8 @@ def finish(code,state,browser_state):
     # The state must also match this browser's cookie, so nobody can push their login into another browser.
     if not o or not item or item[1]<time.time() or not code or not browser_state or not secrets.compare_digest(str(browser_state),str(state)):
         raise LoginError('expired')
-    tokens=_token_request({'grant_type':'authorization_code','code':code,'redirect_uri':o['redirect_uri'],'code_verifier':item[0],
-        'scope':'read write','expires_in':ACCESS_SECONDS,'refresh_token_expires_in':REFRESH_SECONDS})
+    tokens=_token_request({'grant_type':'authorization_code','code':code,'redirect_uri':item[2],'code_verifier':item[0],
+        'scope':scopes(),'expires_in':ACCESS_SECONDS,'refresh_token_expires_in':REFRESH_SECONDS})
     user=_me(tokens['access_token'])
     if user['role'] not in ROLES:
         _revoke(tokens['access_token']);raise LoginError('role')
