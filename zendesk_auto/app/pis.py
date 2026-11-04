@@ -7,7 +7,7 @@ PIS_NAMES = ('전진야','이우리','강지영','김지수','김현우','조한
 SLOTS = ('call1','call2','call3')
 
 def default_members():
-    return [{'name':n,'active':True,'weight':1,'option_value':''} for n in PIS_NAMES]
+    return [{'name':n,'active':True,'option_value':''} for n in PIS_NAMES]
 
 def members(settings):
     return settings.get('pis_members') or default_members()
@@ -19,19 +19,29 @@ def day_entry(settings, day):
     return next((d for d in settings.get('pis_days',[]) if d.get('date')==day), None)
 
 def on_call(settings, day):
-    """Confirmed, non-absent on-call members for the day with their default weight. Never inferred from other days."""
+    """Confirmed, non-absent on-call members for the day. Weight is the day's percentage share; equal when none is set.
+    Never inferred from other days."""
     entry=day_entry(settings, day)
     if not entry:return []
-    weights={m['name']:m.get('weight',1) for m in members(settings) if m.get('active')}
-    return [{**m,'weight':weights[m['name']]} for m in entry['members'] if not m.get('absent') and m['name'] in weights]
+    active={m['name'] for m in members(settings) if m.get('active')}
+    people=[m for m in entry['members'] if not m.get('absent') and m['name'] in active]
+    shared=all(isinstance(m.get('share'),int) and m['share']>0 for m in people)
+    return [{**m,'weight':m['share'] if shared else 1} for m in people]
+
+def check_shares(day):
+    """Shares are percentages among the day's non-absent on-call people: all blank (equal split) or summing to 100."""
+    shares=[m.get('share') for m in day.get('members',[]) if not m.get('absent')]
+    if all(x is None for x in shares):return
+    if any(isinstance(x,bool) or not isinstance(x,int) or not 1<=x<=100 for x in shares):
+        raise ValueError(f"{day['date']}: 배정 비율은 부재가 아닌 젠콜 담당자 모두에게 1~100 사이 정수로 입력하세요.")
+    if sum(shares)!=100:raise ValueError(f"{day['date']}: 배정 비율 합계가 {sum(shares)}%입니다. 100%가 되도록 입력하세요.")
 
 def validate_settings(s, today=None):
     seen=set()
     for m in members(s):
         name=m.get('name','').strip() if isinstance(m.get('name'),str) else ''
         if not name or name in seen:raise ValueError('PIS 명단 이름이 비어 있거나 중복됩니다.')
-        seen.add(name);w=m.get('weight',1)
-        if isinstance(w,bool) or not isinstance(w,(int,float)) or not 0<w<=1000:raise ValueError(f'{name}: 배정 비중은 0보다 크고 1000 이하여야 합니다.')
+        seen.add(name)
     dates=set()
     for d in s.get('pis_days',[]):
         date.fromisoformat(d['date'])
@@ -42,6 +52,7 @@ def validate_settings(s, today=None):
             if m['name'] in names:raise ValueError('같은 날짜에 같은 PIS 담당자가 중복됩니다.')
             names.add(m['name'])
             if m.get('slot') not in SLOTS+('',None):raise ValueError('젠콜 순번 오류')
+        check_shares(d)
     t=s.get('pis_backlog_threshold',0)
     if isinstance(t,bool) or not isinstance(t,int) or not 0<=t<=10:raise ValueError('밀린 티켓 기준 건수는 0~10입니다.')
 
@@ -116,7 +127,7 @@ def normalize_schedule(out, year, roster_names):
             for n in names[:1]:
                 if n not in known:problems.append(f'명단에 없는 이름: {n}');continue
                 if n in seen:problems.append(f'중복된 이름: {n}');continue
-                seen.add(n);people.append({'name':n,'slot':slot,'absent':False})
+                seen.add(n);people.append({'name':n,'slot':slot,'absent':False,'share':None})
         leave=[str(x).strip() for x in d.get('leave',[]) if str(x).strip()]
         for n in leave:
             if n not in known:problems.append(f'명단에 없는 부재자: {n}')

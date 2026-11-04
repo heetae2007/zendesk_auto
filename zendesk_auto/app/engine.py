@@ -2,10 +2,10 @@
 import os, threading, copy
 from datetime import datetime,timedelta
 from .domain import (KST,operating,redact,lexical_search,is_pre_review_screen,apply_pre_review_rule,PRE_REVIEW_PARTS,
-    urgent_candidate,similarity)
+    urgent_candidate,similarity,hospital_name,allowed_agent)
 from .catalog import parts,works,resolve,pis_rows
 from .store import stamp,revision
-from .clients import IntegrationError,WriteRejected
+from .clients import IntegrationError,WriteRejected,model_for
 from .telegram_format import format_notification
 from .pis import on_call,pick_realtime,pick_backlog
 from .zendesk_write import live_enabled,build_update,applied
@@ -19,10 +19,7 @@ class Engine:
     def hospital(self,t,c):
         field=c['settings'].get('mapping',{}).get('hospital_field_id')
         raw=next((x['value'] for x in t.get('custom_fields',[]) if str(x['id'])==str(field)),None)
-        if raw is None:return ''
-        match=next((h for h in c['hospitals'] if h['value']==raw),None)
-        # Dropdown option values are not assumed to be display labels.
-        return match['name'] if match else str(raw)
+        return hospital_name(raw)
 
     def scan(self,c):
         cursor=self.store.state['scan'].get('next')
@@ -46,7 +43,8 @@ class Engine:
         examples=lexical_search(text,self.store.history,hospital)
         improvement=copy.deepcopy(c['settings'].get('prompt_improvement') or {})
         improvement['examples']=[x for x in improvement.get('examples',[]) if str(x.get('ticket_id'))!=str(t['id'])]
-        prompt_version='base-0.11-catalog'+('+'+str(improvement['id']) if improvement.get('id') else '')
+        # The model is part of the version so the analytics tab compares models like prompt versions.
+        prompt_version='base-0.13-handler@'+model_for('ticket',c['settings'])+('+'+str(improvement['id']) if improvement.get('id') else '')
         result={'hospital':hospital,'summary':text[:2000],'part':'','agent_id':None,'agent_name':'',
             'confidence':None,'reason':'','similar_tickets':examples,'search_mode':'문자 유사도 검색',
             'urgent':bool(urgent),'related_ticket_ids':[],'config_revision':revision(c),'mode':'recommendation_only','prompt_version':prompt_version}
@@ -57,14 +55,30 @@ class Engine:
         department_field=c['settings'].get('mapping',{}).get('department_field_id')
         department=next((f.get('value') for f in t.get('custom_fields',[]) if department_field and str(f.get('id'))==str(department_field)),'')
         # Claude decides parts and works only; people always come from the saved catalogue.
-        out=self.ai.classify(text,[p['name'] for p in parts(c)],examples,improvement,
-            {'purpose':'simulation' if simulation else 'ticket','ticket_id':None if simulation else t['id'],'prompt_version':prompt_version,'department':redact(department)[:150]},
-            hospital,work_items=[{'part':w['part'],'work':w['work']} for w in works(c)])
+        context={'purpose':'simulation' if simulation else 'ticket','ticket_id':None if simulation else t['id'],'prompt_version':prompt_version,'department':redact(department)[:150],'settings':c['settings']}
+        work_items=[{'part':w['part'],'work':w['work']} for w in works(c)]
+        # Past handlers are limited to developers on the roster; PIS and others are not sent or used.
+        devs={a['name'] for a in c['agents'] if a.get('name') and allowed_agent(a)}
+        examples=[{**r,'participants':[n for n in r.get('participants',[]) if n in devs]} for r in examples]
+        out=self.ai.classify(text,[p['name'] for p in parts(c)],examples,improvement,context,hospital,work_items=work_items)
+        attachment_note=''
+        # Attachments are read only when the text alone was not enough, and only when the switch is on.
+        if not simulation and c['settings'].get('read_attachments') is True and (out['confidence']<c['settings']['min_confidence'] or out['requires_manual_review']):
+            try:
+                files,skipped=self.z.attachments(t['id'])
+                if files:
+                    version=prompt_version+'+첨부@'+model_for('ticket_attachment',c['settings'])
+                    out=self.ai.classify(text,[p['name'] for p in parts(c)],examples,improvement,{**context,'purpose':'ticket_attachment','prompt_version':version},
+                        hospital,work_items=work_items,attachments=files)
+                    result.update(prompt_version=version,attachments_checked=len(files))
+                attachment_note=f'첨부 {len(files)}개 확인'+(f" (제외: {', '.join(sorted(set(skipped)))})" if skipped else '') if files or skipped else '첨부 없음'
+            except IntegrationError as e:
+                attachment_note='첨부 확인 실패, 본문 기준 결과 유지: '+str(e)
         assignments=out['recommended_assignments']
         pre_review_screen=is_pre_review_screen(text)
         if pre_review_screen:assignments=apply_pre_review_rule(assignments)
         reasons=list(out['review_reasons'])
-        reasons+=resolve(c,assignments,now.date().isoformat(),{} if simulation else loads)
+        reasons+=resolve(c,assignments,now.date().isoformat(),{} if simulation else loads,examples)
         if pre_review_screen:
             for item in assignments:
                 if item['part'] in PRE_REVIEW_PARTS:item['agents']=item['agents'][:1]
@@ -88,6 +102,7 @@ class Engine:
             similar_tickets=examples,search_mode=search_mode,
             status='review' if reasons else 'recommended')
         if reasons:result['reason']=' / '.join(reasons)+' / '+out['reason']
+        if attachment_note:result.update(attachment_note=attachment_note,reason=attachment_note+' / '+result['reason'])
         for other in unresolved:
             if other['id']==t['id'] or self.hospital(other,c)!=hospital:continue
             try:recent=datetime.fromisoformat(other['created_at'].replace('Z','+00:00'))>=now-timedelta(days=7)
@@ -205,7 +220,7 @@ class Engine:
             with self.store.lock:
                 c=copy.deepcopy(self.store.refresh())
             if not c['settings']['enabled']:return {'skipped':'disabled'}
-            if not os.getenv('ZENDESK_API_TOKEN'):return {'skipped':'zendesk_not_connected'}
+            if not getattr(self.z,'ready',True):return {'skipped':'zendesk_not_connected'}
             self.scan(c)
             allowed,reason=operating(c,now)
             if not allowed:

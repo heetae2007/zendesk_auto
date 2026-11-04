@@ -8,12 +8,24 @@ from .pis import members
 BASE_VERSION='base-0.4'
 CATEGORIES={'match':'일치','part_error':'파트 오분류','person_change':'담당자 변경','no_actual':'실제 담당 정보 없음','no_decision':'자동 추천 이력 없음'}
 
+def category(case):
+    """A recommendation matches only when its developers are exactly the people who handled the ticket."""
+    rec_parts,actual_parts=set(case.get('rec_parts',[])),set(case.get('actual_parts',[]))
+    rec_devs,actual_devs=set(case.get('rec_devs',[])),set(case.get('actual_devs',[]))
+    if not actual_parts:return 'no_actual'
+    if not rec_parts&actual_parts:return 'part_error'
+    if actual_devs and rec_devs!=actual_devs:return 'person_change'
+    return 'match'
+
 class Analytics:
     def __init__(self,store):
         self.store=store;self.lock=threading.RLock()
         self.usage=store.read('usage_events',[])
         self.decisions=store.read('decision_events',[])
         self.cases=store.read('evaluation_cases',{})
+        # Cases imported under the older rule (one shared person was enough) are re-judged.
+        for x in self.cases.values():
+            if x.get('category') in ('match','part_error','person_change','no_actual') and 'rec_parts' in x:x['category']=category(x)
         self.prompts=store.read('prompt_versions',[])
 
     def _save(self,name,value):atomic_json(self.store.root/(name+'.json'),value)
@@ -65,10 +77,7 @@ class Analytics:
                     case.update(decision_at=d['at'],prompt_version=d.get('prompt_version',BASE_VERSION),
                         rec_parts=sorted(parts),rec_devs=sorted(people),rec_pis=d.get('pis_name',''),
                         rec_works=[{'part':r['part'],'works':r.get('works',[]),'agents':[p['agent_name'] for p in r.get('agents',[])]} for r in assign])
-                    if not actual_parts:case['category']='no_actual'
-                    elif not parts&actual_parts:case['category']='part_error'
-                    elif actual_devs and not people&actual_devs:case['category']='person_change'
-                    else:case['category']='match'
+                    case['category']=category(case)
                     case['pis_changed']=bool(actual_pis and d.get('pis_name') and d['pis_name'] not in actual_pis)
                 self.cases[tid]=case
             self._save('evaluation_cases',self.cases)
@@ -98,6 +107,8 @@ class Analytics:
             'by_version':[{'version':k,**v,'part_accuracy':rate(v['part_ok'],v['cases']),'dev_accuracy':rate(v['dev_ok'],v['cases'])} for k,v in sorted(by.items())],
             'usage_requests':len(self.usage),'usage_known':len(known),
             'input_tokens':sum(u['input_tokens'] for u in known),'output_tokens':sum(u['output_tokens'] for u in known),
+            'cache_read_tokens':sum(u.get('cache_read_input_tokens') or 0 for u in known),
+            'cache_write_tokens':sum(u.get('cache_creation_input_tokens') or 0 for u in known),
             'usage_unknown':len(self.usage)-len(known)}
 
     def suggestions(self):

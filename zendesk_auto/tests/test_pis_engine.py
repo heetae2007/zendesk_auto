@@ -12,11 +12,11 @@ MAPS=[{'part':'보험','work':'심사','developer':'김종오','developer_backup
       {'part':'보험','work':'청구','developer':'이선주','developer_backup':'','pis':'노주영','pis_backup':'이혜경'}]
 
 def oncall(*rows):
-    return [{'date':DAY,'members':[{'name':n,'slot':'call1','absent':ab} for n,w,ab in rows]}]
+    return [{'date':DAY,'members':[{'name':n,'slot':'call1','absent':ab,'share':w} for n,w,ab in rows]}]
 
 def roster(c,*rows,extra=()):
-    """rows: (name, weight, absent). Weight lives on the PIS member; the day only lists who is on call."""
-    c['settings']['pis_members']=[{'name':n,'active':True,'weight':w,'option_value':''} for n,w,_ in rows]+[{'name':n,'active':True,'weight':1,'option_value':''} for n in extra]
+    """rows: (name, share %, absent). The share lives on the day's on-call entry, not on the PIS roster."""
+    c['settings']['pis_members']=[{'name':n,'active':True,'option_value':''} for n,_,_ in rows]+[{'name':n,'active':True,'option_value':''} for n in extra]
     c['settings']['pis_days']=oncall(*rows)
 
 @pytest.fixture
@@ -37,9 +37,25 @@ def test_realtime_weights_from_ledger_and_never_off_roster(system):
     first=s.state['pis']['1']['name']
     assert e.pick_pis(s.config,1,{},DAY)[0]==first and len(s.state['pis'])==10
 
+def test_blank_shares_split_equally(system):
+    s,z,a,t,e=system
+    roster(s.config,('A',None,False),('B',None,False))
+    for tid in range(1,5):e.pick_pis(s.config,tid,{},DAY)
+    assert sorted(v['name'] for v in s.state['pis'].values())==['A','A','B','B']
+
+@pytest.mark.parametrize('shares,ok',[((None,None,None),True),((40,30,30),True),((40,30,None),False),((40,30,20),False),((0,50,50),False),((50.5,25,24.5),False)])
+def test_day_shares_must_total_100(shares,ok):
+    c=config();names=('A','B','C')
+    c['settings']['pis_members']=[{'name':n,'active':True,'option_value':''} for n in names+('D',)]
+    c['settings']['pis_days']=[{'date':DAY,'members':[{'name':n,'slot':k,'absent':False,'share':w} for n,k,w in zip(names,('call1','call2','call3'),shares)]
+        +[{'name':'D','slot':'','absent':True,'share':70}]}]
+    if ok:validate_config(c)
+    else:
+        with pytest.raises(ValueError,match='배정 비율'):validate_config(c)
+
 def test_inactive_member_is_not_assigned(system):
     s,z,a,t,e=system
-    roster(s.config,('A',1,False));s.config['settings']['pis_members'][0]['active']=False
+    roster(s.config,('A',100,False));s.config['settings']['pis_members'][0]['active']=False
     assert e.pick_pis(s.config,1,{},DAY)[0] is None
 
 def test_no_confirmed_oncall_means_review(system):
@@ -56,7 +72,7 @@ def test_realtime_tick_sets_pis_and_telegram(system):
 def test_backlog_primary_then_backup_then_weighted_overflow(system):
     s,z,a,t,e=system
     s.config['settings']['work_mappings']=MAPS
-    roster(s.config,('노주영',1,False),('이혜경',1,False),('김갑진',2,False),('강지영',5,True),extra=('전진야',))
+    roster(s.config,('노주영',25,False),('이혜경',25,False),('김갑진',50,False),('강지영',None,True),extra=('전진야',))
     used=set();r={'recommended_assignments':[{'part':'보험','works':['심사']}]}
     assert e.pick_pis(s.config,1,r,DAY,used)==('노주영','밀린 티켓 묶음: 주담당')
     assert e.pick_pis(s.config,2,r,DAY,used)==('이혜경','밀린 티켓 묶음: 백업')
@@ -74,7 +90,7 @@ def test_backlog_skips_off_roster_primary():
 
 def test_backlog_uses_part_default_when_no_work(system):
     s,z,a,t,e=system;s.config['settings']['parts'][0].update(pis='김갑진')
-    roster(s.config,('김갑진',1,False),('이혜경',1,False))
+    roster(s.config,('김갑진',50,False),('이혜경',50,False))
     assert e.pick_pis(s.config,1,{'recommended_assignments':[{'part':'보험','works':[]}]},DAY,set())==('김갑진','밀린 티켓 묶음: 주담당')
 
 def test_backlog_threshold_in_tick(system):
@@ -142,3 +158,31 @@ def test_analysis_failure_still_gets_pis(system):
     a.classify=fail
     for _ in range(4):e.tick(NOW)
     j=s.state['jobs']['1'];assert j['status']=='review' and j['pis_name']=='이혜경'
+
+def test_claude_payload_is_lean_cached_and_per_purpose(monkeypatch):
+    import json, httpx
+    from app import clients
+    sent=[]
+    class R:
+        status_code=200
+        def __init__(self,body):self.body=body
+        def json(self):return self.body
+    out=ai_out(works=['심사']);out['ticket_id']=0;out['hospital']='병원'
+    def post(url,headers,json,timeout):
+        sent.append(json);return R({'stop_reason':'end_turn','content':[{'type':'thinking','thinking':''},{'type':'text','text':clients.json.dumps(out)}],'usage':{}})
+    monkeypatch.setattr(httpx,'post',post)
+    monkeypatch.setenv('ANTHROPIC_API_KEY','fake-test-only');monkeypatch.setenv('ANTHROPIC_MODEL','claude-sonnet-4-6')
+    monkeypatch.setenv('ANTHROPIC_MODEL_TICKET','claude-haiku-5-5');
+    for n in ('ANTHROPIC_MODEL_IMAGE','ANTHROPIC_MODEL_SCHEDULE'):monkeypatch.delenv(n,raising=False)
+    monkeypatch.delenv('ANTHROPIC_EFFORT',raising=False)
+    ai=AI(None);history=[{'ticket_id':7,'summary':'가'*2000,'parts':['보험']}]
+    ai.classify('문의',['보험'],history,None,{'purpose':'ticket'},'병원',work_items=MAPS)
+    p=sent[0];stable,ticket=p['messages'][0]['content']
+    assert p['model']=='claude-haiku-5-5' and p['output_config']['effort']=='low'
+    assert stable['cache_control']=={'type':'ephemeral'} and 'ticket' not in json.loads(stable['text'])
+    assert len(json.loads(ticket['text'])['historical_cases'][0]['summary'])==400
+    # Schedule reading falls back to ANTHROPIC_MODEL; 4.x models get no effort field.
+    monkeypatch.setattr(ai,'_post',clients.AI._post.__get__(ai))
+    try:ai.read_schedule(b'x','image/png',['A'])
+    except IntegrationError:pass
+    assert sent[1]['model']=='claude-sonnet-4-6' and 'effort' not in sent[1]['output_config']

@@ -1,15 +1,15 @@
-import os,json,threading,secrets,fcntl,zipfile
+import os,json,threading,fcntl,zipfile
 from pathlib import Path
 from io import BytesIO
 from contextlib import asynccontextmanager
 from datetime import datetime
 from fastapi import FastAPI,Depends,HTTPException,Request,UploadFile,File
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse,RedirectResponse,JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.security import HTTPBasic,HTTPBasicCredentials
 from .domain import validate_config,operating,KST,defaults,redact
 from .store import Store,Sheets,revision
-from .clients import Zendesk,AI,Telegram
+from .clients import Zendesk,AI,Telegram,IntegrationError,MODELS,EFFORTS,env_model,model_for
+from . import runtime
 from .engine import Engine
 from .importer import import_xlsx
 from .analytics import Analytics
@@ -34,14 +34,11 @@ def make_store():
     return Store(os.getenv('DATA_DIR','./data'),sheets)
 
 store=make_store();analytics=Analytics(store);engine=Engine(store,Zendesk(),AI(store.root,analytics),Telegram(),analytics);stop=threading.Event()
-security=HTTPBasic(auto_error=False)
 
-def auth(creds:HTTPBasicCredentials|None=Depends(security)):
-    expected=os.getenv('ADMIN_PASSWORD','')
-    if len(expected)<16 or expected=='CHANGE_ME_TO_A_LONG_RANDOM_PASSWORD':raise HTTPException(503,'서버 ADMIN_PASSWORD를 16자 이상으로 설정하세요.')
-    if not creds or not secrets.compare_digest(creds.username.encode(),b'admin') or not secrets.compare_digest(creds.password.encode(),expected.encode()):
-        raise HTTPException(401,'로그인이 필요합니다.',headers={'WWW-Authenticate':'Basic realm="Zendesk Admin"'})
-    return 'admin'
+def auth(request:Request):
+    user=runtime.session_user(request.cookies.get(runtime.COOKIE))
+    if not user:raise HTTPException(401,'로그인이 필요합니다.')
+    return user
 
 def loop():
     while not stop.wait(60):engine.tick()
@@ -75,7 +72,7 @@ async def pis_schedule_read(file:UploadFile=File(...),year:int=0):
     year=year or datetime.now(KST).year
     if not 2020<=year<=2100:raise HTTPException(400,'연도 범위 오류')
     names=active_names(store.config['settings'])
-    try:out=engine.ai.read_schedule(data,kind,names)
+    try:out=engine.ai.read_schedule(data,kind,names,store.config['settings'])
     except Exception as e:
         from .clients import IntegrationError
         raise HTTPException(503,'배정표 분석 실패: '+(str(e) if isinstance(e,IntegrationError) else type(e).__name__))
@@ -83,7 +80,7 @@ async def pis_schedule_read(file:UploadFile=File(...),year:int=0):
 
 @app.get('/api/zendesk/preflight',dependencies=[Depends(auth)])
 def zendesk_preflight():
-    if not os.getenv('ZENDESK_API_TOKEN'):raise HTTPException(400,'Zendesk 인증정보를 서버에 설정하세요.')
+    if not engine.z.ready:raise HTTPException(400,'Zendesk 계정을 설정하세요.')
     try:meta=engine.z.metadata()
     except Exception:raise HTTPException(503,'Zendesk 설정 조회 실패. API 권한을 확인하세요.')
     return {'check':preflight(store.config,meta),'options':suggest(store.config,meta)}
@@ -99,7 +96,6 @@ def write_verify(tid:int):
 @app.middleware('http')
 async def headers(request:Request,call_next):
     if request.method not in ('GET','HEAD','OPTIONS') and request.headers.get('x-requested-with')!='zendesk-admin':
-        from fastapi.responses import JSONResponse
         return JSONResponse({'detail':'요청 검증 실패'},status_code=403)
     response=await call_next(request)
     response.headers['Cache-Control']='no-store'
@@ -108,8 +104,71 @@ async def headers(request:Request,call_next):
     response.headers['Content-Security-Policy']="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
     return response
 
-@app.get('/',dependencies=[Depends(auth)])
-def index():return FileResponse(Path(__file__).parent/'static/index.html')
+@app.get('/')
+def index(request:Request):
+    if not runtime.session_user(request.cookies.get(runtime.COOKIE)):return RedirectResponse('/login',302)
+    return FileResponse(Path(__file__).parent/'static/index.html')
+
+@app.get('/login')
+def login_page():return FileResponse(Path(__file__).parent/'static/login.html')
+
+@app.get('/auth/info')
+def auth_info():
+    info=runtime.public()
+    # Shown before login: who holds the server login, never any token.
+    return {'mode':info['mode'],'subdomain':info['subdomain'],'current':info['user']['name'] if info['user'] else None,
+        'intake_paused':runtime.mode()=='oauth' and not info['user']}
+
+def session_cookie(response,sid):
+    response.set_cookie(runtime.COOKIE,sid,max_age=runtime.SESSION_SECONDS,httponly=True,samesite='lax',secure=bool((runtime.oauth() or {}).get('secure')))
+    return response
+
+@app.get('/auth/login')
+def oauth_start():
+    if not runtime.oauth():return RedirectResponse('/login',302)
+    url,state=runtime.start()
+    r=RedirectResponse(url,302)
+    r.set_cookie(runtime.STATE_COOKIE,state,max_age=runtime.STATE_SECONDS,httponly=True,samesite='lax',secure=runtime.oauth()['secure'],path='/auth')
+    return r
+
+@app.get('/auth/callback')
+def oauth_callback(request:Request,code:str='',state:str='',error:str=''):
+    if error:return RedirectResponse('/login?e=denied',302)
+    # Any running analysis finishes with the account it started with.
+    if not engine.run_lock.acquire(timeout=60):return RedirectResponse('/login?e=busy',302)
+    try:sid,_=runtime.finish(code,state,request.cookies.get(runtime.STATE_COOKIE))
+    except runtime.LoginError as e:return RedirectResponse('/login?e='+(str(e) if str(e) in ('expired','role') else 'failed'),302)
+    finally:engine.run_lock.release()
+    r=session_cookie(RedirectResponse('/',302),sid);r.delete_cookie(runtime.STATE_COOKIE,path='/auth')
+    return r
+
+@app.post('/auth/password')
+def password_login(body:dict):
+    if runtime.oauth():raise HTTPException(400,'Zendesk 계정으로 로그인하세요.')
+    try:sid=runtime.password_login(body.get('password'))
+    except runtime.LoginError as e:raise HTTPException(401,str(e))
+    return session_cookie(JSONResponse({'ok':True}),sid)
+
+@app.post('/auth/logout',dependencies=[Depends(auth)])
+def logout():
+    if not engine.run_lock.acquire(timeout=60):raise HTTPException(409,'분석 완료 후 다시 시도하세요.')
+    try:runtime.logout()
+    finally:engine.run_lock.release()
+    r=JSONResponse({'ok':True});r.delete_cookie(runtime.COOKIE)
+    return r
+
+def daily_counts(jobs,today,days=14):
+    """Tickets per Zendesk creation date (KST) for the last two weeks, zero days included."""
+    from datetime import date,timedelta
+    rows={(today-timedelta(days=i)).isoformat():{'total':0,'recommended':0,'review':0,'deferred':0,'other':0,'written':0} for i in range(days)}
+    for j in jobs:
+        try:d=datetime.fromisoformat(str(j.get('created_at')).replace('Z','+00:00')).astimezone(KST).date().isoformat()
+        except ValueError:continue
+        if d not in rows:continue
+        r=rows[d];r['total']+=1
+        r[j.get('status') if j.get('status') in ('recommended','review','deferred') else 'other']+=1
+        r['written']+=j.get('write_status')=='done'
+    return [{'date':d,**v} for d,v in sorted(rows.items(),reverse=True)]
 
 @app.get('/api/state',dependencies=[Depends(auth)])
 def state():
@@ -122,11 +181,15 @@ def state():
         'pis_members':members(c['settings']),'catalog_warnings':unknown_people(c),
         'writes':{k:{x:v.get(x) for x in ('status','at','error')} for k,v in store.state.get('writes',{}).items()}, 'storage':'Google Sheets' if store.sheets else '로컬 설정 테스트',
         'ready':store.ready,'operating':allowed,'operating_reason':why,'now':datetime.now(KST).isoformat(),
+        'daily':daily_counts(store.state['jobs'].values(),datetime.now(KST).date()),
         'jobs':sorted(store.state['jobs'].values(),key=lambda x:x.get('updated_at',''),reverse=True)[:300],
         'history_count':len(store.history),'completed_count':sum(r.get('completed',False) for r in store.history),
         'last_tick':store.state['last_tick'],'last_error':store.state['last_error'],
         'notifications':store.state['notifications'],
-        'connections':{'zendesk':bool(os.getenv('ZENDESK_API_TOKEN')),'claude':bool(os.getenv('ANTHROPIC_API_KEY') and os.getenv('ANTHROPIC_MODEL','claude-sonnet-4-6')),
+        'login':runtime.public(),
+        'models':{'options':list(MODELS),'efforts':list(EFFORTS),'env':{'ticket':env_model('ticket'),'image':env_model('pis_schedule'),'effort':os.getenv('ANTHROPIC_EFFORT','low') or 'low'},
+            'effective':{'ticket':model_for('ticket',c['settings']),'image':model_for('pis_schedule',c['settings'])}},
+        'connections':{'zendesk':engine.z.ready,'claude':bool(os.getenv('ANTHROPIC_API_KEY')),
             'telegram':bool(os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID'))}}
 
 @app.post('/api/config',dependencies=[Depends(auth)])
@@ -160,7 +223,7 @@ def refresh():
 
 @app.get('/api/zendesk/metadata',dependencies=[Depends(auth)])
 def metadata():
-    if not os.getenv('ZENDESK_API_TOKEN'):raise HTTPException(400,'Zendesk 인증정보를 서버에 설정하세요.')
+    if not engine.z.ready:raise HTTPException(400,'Zendesk 계정을 설정하세요.')
     try:return engine.z.metadata()
     except Exception:raise HTTPException(503,'Zendesk 설정 조회 실패. API 권한을 확인하세요.')
 

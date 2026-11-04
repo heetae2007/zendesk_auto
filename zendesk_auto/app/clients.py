@@ -1,9 +1,22 @@
-import os, json, base64
-from urllib.parse import urlparse
+import os, re, json, base64
+from urllib.parse import urlparse, urljoin
 from .domain import redact, lexical_search
 from .prompt_multi import SYSTEM_PROMPT
 
+HISTORY_CHARS=400  # per past-case summary sent to Claude; the bulk of input tokens
+
+ATTACH_LIMIT=3;ATTACH_BYTES=5*1024*1024  # per ticket / per file
+
 class IntegrationError(Exception): pass
+
+def sniff(data):
+    """Media type from the file's own bytes; Zendesk's content_type is not trusted."""
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):return 'image/png'
+    if data.startswith(b'\xff\xd8\xff'):return 'image/jpeg'
+    if data[:6] in (b'GIF87a',b'GIF89a'):return 'image/gif'
+    if data[:4]==b'RIFF' and data[8:12]==b'WEBP':return 'image/webp'
+    if data.startswith(b'%PDF-'):return 'application/pdf'
+    return None
 class WriteRejected(IntegrationError):
     """Zendesk definitely did not apply the update (4xx, including safe-update 409)."""
 class WriteUnknown(IntegrationError):
@@ -12,11 +25,21 @@ class WriteUnknown(IntegrationError):
 class Zendesk:
     """Reads tickets; update_ticket is called only by the gated intake path."""
     def __init__(self):
+        self.configure()
+
+    def configure(self):
+        """(Re)build the HTTP client. Credentials are looked up per request, so a new login applies at once."""
         import httpx
-        domain=os.getenv('ZENDESK_SUBDOMAIN','edgennext')
-        if not domain.replace('-','').isalnum():raise ValueError('Zendesk subdomain 오류')
-        self.base=f'https://{domain}.zendesk.com/api/v2'
-        self.http=httpx.Client(auth=(os.getenv('ZENDESK_EMAIL','')+'/token',os.getenv('ZENDESK_API_TOKEN','')),timeout=25)
+        from . import runtime
+        old=getattr(self,'http',None)
+        self.base=f"https://{runtime.subdomain()}.zendesk.com/api/v2"
+        self.http=httpx.Client(auth=runtime.zendesk_auth(),timeout=25)
+        if old:old.close()
+
+    @property
+    def ready(self):
+        from . import runtime
+        return runtime.zendesk_ready()
 
     def get(self,path,params=None):
         url=path if path.startswith('https://') else self.base+path
@@ -48,6 +71,45 @@ class Zendesk:
 
     def ticket(self,tid):return self.get(f'/tickets/{int(tid)}.json')['ticket']
 
+    def attachments(self,tid):
+        """Image/PDF files attached to the ticket's comments, oldest first. Returns (files, skipped notes)."""
+        r=self.get(f'/tickets/{int(tid)}/comments.json',{'include_inline_images':'true'})
+        files=[];skipped=[]
+        for comment in r.get('comments',[]):
+            for a in comment.get('attachments',[]):
+                ctype=str(a.get('content_type','')).lower()
+                if a.get('deleted') or a.get('malware_scan_result')=='malware_found':skipped.append('삭제·악성코드 파일');continue
+                if not (ctype.startswith('image/') or ctype=='application/pdf'):skipped.append('지원하지 않는 형식');continue
+                if len(files)>=ATTACH_LIMIT:skipped.append('개수 제한 초과');continue
+                if not isinstance(a.get('size'),int) or a['size']>ATTACH_BYTES:skipped.append('5MB 초과');continue
+                data=self.download(str(a.get('content_url','')))
+                kind=sniff(data)
+                if not kind:skipped.append('지원하지 않는 형식');continue
+                files.append({'media_type':kind,'data':data})
+        return files,skipped
+
+    def download(self,url):
+        """Credentials go only to our own Zendesk host; redirects are followed by hand so they never leak."""
+        import httpx
+        own=urlparse(self.base).netloc
+        for _ in range(4):
+            u=urlparse(url)
+            if u.scheme!='https' or not u.netloc:raise IntegrationError('첨부 URL 거부')
+            client=self.http if u.netloc==own else httpx.Client(timeout=25)
+            try:
+                with client.stream('GET',url,follow_redirects=False) as r:
+                    if r.is_redirect:url=urljoin(url,r.headers.get('location',''));continue
+                    if r.status_code>=400:raise IntegrationError(f'첨부 다운로드 HTTP {r.status_code}')
+                    buf=bytearray()
+                    for chunk in r.iter_bytes():
+                        buf+=chunk
+                        if len(buf)>ATTACH_BYTES:raise IntegrationError('첨부 크기 초과')
+                    return bytes(buf)
+            except httpx.RequestError:raise IntegrationError('첨부 다운로드 실패') from None
+            finally:
+                if client is not self.http:client.close()
+        raise IntegrationError('첨부 리다이렉트 과다')
+
     def update_ticket(self,tid,payload):
         import httpx
         try:r=self.http.put(f'{self.base}/tickets/{int(tid)}.json',json=payload)
@@ -68,6 +130,34 @@ class Zendesk:
             if not url:raise IntegrationError('미해결 티켓 pagination 오류')
         raise IntegrationError('미해결 티켓 조회 한도 초과')
 
+# Images (schedule screenshots, ticket attachments) share one model; ANTHROPIC_MODEL_SCHEDULE is the older name.
+MODEL_ENV={'ticket':('ANTHROPIC_MODEL_TICKET',),'simulation':('ANTHROPIC_MODEL_TICKET',),
+    'pis_schedule':('ANTHROPIC_MODEL_IMAGE','ANTHROPIC_MODEL_SCHEDULE'),'ticket_attachment':('ANTHROPIC_MODEL_IMAGE','ANTHROPIC_MODEL_SCHEDULE')}
+MODEL_KIND={'ticket':'ticket','simulation':'ticket','pis_schedule':'image','ticket_attachment':'image'}
+MODELS=('claude-haiku-5-5','claude-sonnet-5-5','claude-sonnet-4-6')
+EFFORTS=('low','medium','high')
+
+def env_model(purpose):
+    names=MODEL_ENV.get(purpose,())+('ANTHROPIC_MODEL',)
+    return next((v for v in (os.getenv(n,'').strip() for n in names) if v),'claude-sonnet-4-6')
+
+def model_for(purpose,settings=None):
+    """Model chosen on the settings screen for this purpose; otherwise .env, then ANTHROPIC_MODEL."""
+    chosen=((settings or {}).get('models') or {}).get(MODEL_KIND.get(purpose,''),'')
+    return chosen or env_model(purpose)
+
+def effort_for(model,settings=None):
+    # Claude 5.x models think adaptively by default; low effort keeps classification output short.
+    if not re.match(r'claude-(haiku|sonnet|opus|fable)-5',model):return None
+    return ((settings or {}).get('models') or {}).get('effort') or os.getenv('ANTHROPIC_EFFORT','low').strip() or 'low'
+
+def validate_models(settings):
+    m=settings.get('models',{})
+    if not isinstance(m,dict) or set(m)-{'ticket','image','effort'}:raise ValueError('모델 설정 오류')
+    for k in ('ticket','image'):
+        if m.get(k,'') not in ('',)+MODELS:raise ValueError(f'지원하지 않는 모델: {m.get(k)}')
+    if m.get('effort','') not in ('',)+EFFORTS:raise ValueError('사고량은 low, medium, high 중 하나입니다.')
+
 class AI:
     def __init__(self,root,analytics=None):
         self.analytics=analytics
@@ -78,13 +168,16 @@ class AI:
 
     def _post(self,system,content,schema,context,max_tokens=2048,timeout=45.0):
         """One structured-output Messages call; returns the parsed JSON object."""
-        model=os.getenv('ANTHROPIC_MODEL','claude-sonnet-4-6').strip()
+        settings=(context or {}).get('settings')
+        model=model_for((context or {}).get('purpose',''),settings)
         key=os.getenv('ANTHROPIC_API_KEY','').strip()
         if not model or not key:raise IntegrationError('Claude 모델/API 키 미설정')
         import httpx
         payload={'model':model,'max_tokens':max_tokens,'system':system,
             'messages':[{'role':'user','content':content}],
             'output_config':{'format':{'type':'json_schema','schema':schema}}}
+        effort=effort_for(model,settings)
+        if effort:payload['output_config']['effort']=effort;payload['max_tokens']=max(max_tokens,4096)
         headers={'x-api-key':key,'anthropic-version':'2023-06-01','content-type':'application/json'}
         workspace=os.getenv('ANTHROPIC_WORKSPACE_ID','').strip()
         if workspace:headers['anthropic-workspace-id']=workspace
@@ -122,13 +215,13 @@ class AI:
         except (ValueError,TypeError,KeyError):raise IntegrationError('Claude 응답 분석 실패') from None
         return out
 
-    def read_schedule(self,image,media_type,roster_names):
+    def read_schedule(self,image,media_type,roster_names,settings=None):
         """Extract on-call rows from a schedule screenshot for human review."""
         from .pis import SCHEDULE_SCHEMA,SCHEDULE_PROMPT
         if media_type not in ('image/png','image/jpeg','image/webp'):raise IntegrationError('PNG, JPEG, WebP 이미지만 지원합니다.')
         content=[{'type':'image','source':{'type':'base64','media_type':media_type,'data':base64.standard_b64encode(image).decode()}},
             {'type':'text','text':json.dumps({'pis_roster':list(roster_names)},ensure_ascii=False)}]
-        out=self._post(SCHEDULE_PROMPT,content,SCHEDULE_SCHEMA,{'purpose':'pis_schedule','prompt_version':'pis-schedule-1.0'},max_tokens=8000,timeout=120.0)
+        out=self._post(SCHEDULE_PROMPT,content,SCHEDULE_SCHEMA,{'purpose':'pis_schedule','prompt_version':'pis-schedule-1.0','settings':settings},max_tokens=8000,timeout=120.0)
         if set(out)!={'days','warnings'} or not isinstance(out['days'],list) or not isinstance(out['warnings'],list):raise IntegrationError('배정표 응답 구조 오류')
         for d in out['days']:
             if not isinstance(d,dict) or set(d)!=set(SCHEDULE_SCHEMA['properties']['days']['items']['required']):raise IntegrationError('배정표 응답 구조 오류')
@@ -138,7 +231,7 @@ class AI:
                 if d[k] is not None and (isinstance(d[k],bool) or not isinstance(d[k],int)):raise IntegrationError('배정표 날짜 형식 오류')
         return out
 
-    def classify(self,text,parts,examples,improvement=None,context=None,hospital="",work_items=None):
+    def classify(self,text,parts,examples,improvement=None,context=None,hospital="",work_items=None,attachments=()):
         """Summary, parts and works only. People are chosen from the catalogue by the caller."""
         nullable_string={'anyOf':[{'type':'string'},{'type':'null'}]}
         assignment_schema={'type':'object','additionalProperties':False,'properties':{
@@ -156,14 +249,23 @@ class AI:
             'requires_manual_review':{'type':'boolean'},'review_reasons':{'type':'array','items':{'type':'string'}},
             'reason':{'type':'string'}},
             'required':['ticket_id','hospital','summary','issue_type','recommended_assignments','confidence','urgent','urgent_reason','requires_manual_review','review_reasons','reason']}
-        data={'ticket':{'ticket_id':(context or {}).get('ticket_id') or 0,'hospital':redact(hospital)[:150], 'request_department':redact((context or {}).get('department',''))[:150], 'text':redact(text)},
+        data={'ticket':{'ticket_id':(context or {}).get('ticket_id') or 0,'hospital':redact(hospital)[:150], 'request_department':redact((context or {}).get('department',''))[:150], 'text':redact(text),
+                'attached_files':len(attachments)},
             'available_parts':parts,
             'work_items':[{'part':w['part'],'work':w['work']} for w in (work_items or [])],
-            'historical_cases':[{'ticket_id':r['ticket_id'],'summary':redact(r['summary']),'parts':r['parts']} for r in examples],
+            'historical_cases':[{'ticket_id':r['ticket_id'],'summary':redact(r['summary'])[:HISTORY_CHARS],'parts':r['parts'],
+                'handled_by':r.get('participants',[])} for r in examples],
             'reviewed_corrections':(improvement or {}).get('examples',[])}
+        # The catalogue part is identical on every call, so it is cached together with the system prompt.
+        stable={k:data[k] for k in ('available_parts','work_items','reviewed_corrections')}
+        content=[{'type':'text','text':json.dumps(stable,ensure_ascii=False),'cache_control':{'type':'ephemeral'}},
+            # File names are not sent: they often contain patient names.
+            *[{'type':'image' if f['media_type'].startswith('image/') else 'document','source':{'type':'base64','media_type':f['media_type'],
+                'data':base64.standard_b64encode(f['data']).decode()}} for f in attachments],
+            {'type':'text','text':json.dumps({k:data[k] for k in ('ticket','historical_cases')},ensure_ascii=False)}]
         works_by_part={}
         for w in work_items or []:works_by_part.setdefault(w['part'],set()).add(w['work'])
-        out=self._post(SYSTEM_PROMPT,json.dumps(data,ensure_ascii=False),schema,context)
+        out=self._post(SYSTEM_PROMPT,content,schema,context,timeout=90.0 if attachments else 45.0)
         if set(out)!=set(schema['required']):raise IntegrationError('AI 응답 구조 오류')
         if isinstance(out['confidence'],bool) or not isinstance(out['confidence'],(int,float)) or not 0<=out['confidence']<=1:raise IntegrationError('AI 신뢰도 오류')
         if not isinstance(out['requires_manual_review'],bool) or not isinstance(out['urgent'],bool):raise IntegrationError('AI boolean 오류')

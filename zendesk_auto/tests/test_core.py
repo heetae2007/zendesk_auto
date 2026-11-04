@@ -1,7 +1,7 @@
 import copy,io,threading
 from datetime import datetime,date
 import pytest
-from app.domain import defaults,operating,KST,redact,validate_config
+from app.domain import defaults,operating,KST,redact,validate_config,lexical_search
 from app.store import Store,revision
 from app.engine import Engine
 from app.importer import import_xlsx
@@ -64,9 +64,9 @@ def test_holiday_and_override():
     c['calendar'][0]['closed']=True
     assert not operating(c,NOW,[])[0]
 
-def people(c,assignments,loads=None):
+def people(c,assignments,loads=None,history=()):
     from app.catalog import resolve
-    rows=copy.deepcopy(assignments);reasons=resolve(c,rows,'2026-11-02',loads or {})
+    rows=copy.deepcopy(assignments);reasons=resolve(c,rows,'2026-11-02',loads or {},history)
     return [[p['agent_name'] for p in r['agents']] for r in rows],reasons
 
 def test_catalogue_primary_then_backup():
@@ -91,6 +91,25 @@ def test_multiple_works_give_multiple_developers_and_missing_work_is_review():
     assert people(c,[{'part':'보험','works':['심사','청구']}])[0]==[['채희태','이정기']]
     names,reasons=people(c,[{'part':'보험','works':[]}])
     assert names==[['김종오']] and '세부업무가 확인되지' in reasons[0]
+
+HIST=[{'ticket_id':1,'parts':['보험'],'participants':['이정기']},{'ticket_id':2,'parts':['보험'],'participants':['채희태']},
+    {'ticket_id':3,'parts':['보험'],'participants':['이정기','채희태']},{'ticket_id':4,'parts':['원무'],'participants':['신승용']}]
+
+def test_past_handler_only_when_catalogue_names_nobody():
+    c=config();c['settings']['work_mappings']=[{'part':'보험','work':'심사','developer':'채희태'}]
+    # The catalogue wins: matching work, then the part's own developer.
+    assert people(c,[{'part':'보험','works':['심사']}],history=HIST)[0]==[['채희태']]
+    assert people(c,[{'part':'원무','works':[],'supporting_ticket_ids':[4]}],history=HIST)[0]==[['김구현']]
+    c['settings']['parts'][0].update(developer='',developer_backup='')
+    names,reasons=people(c,[{'part':'보험','works':[],'supporting_ticket_ids':[1,3]}],history=HIST)
+    assert names==[['이정기']] and any('과거 처리자(이정기)' in r for r in reasons)
+    # Without cited tickets, every given case of the same part counts; ties keep similarity order.
+    assert people(c,[{'part':'보험','works':[],'supporting_ticket_ids':[]}],history=HIST)[0]==[['이정기']]
+    # Absent people are skipped; no past handler means nobody, as before.
+    c['settings']['absences']=[{'id':'x','agent_id':next(a['id'] for a in c['agents'] if a['name']=='이정기'),'start':'2026-11-01','end':'2026-11-03'}]
+    assert people(c,[{'part':'보험','works':[],'supporting_ticket_ids':[1,3]}],history=HIST)[0]==[['채희태']]
+    names,reasons=people(c,[{'part':'보험','works':[]}],history=[])
+    assert names==[[]] and '배정 가능한' in ' '.join(reasons)
 
 def test_excluded_names_never_resolved():
     c=config();c['settings']['parts'][0]['developer']='윤새라'
@@ -225,3 +244,18 @@ def test_sheets_offline_after_restart_keeps_last_saved(tmp_path):
     offline=Store(tmp_path,FakeSheets(fail=True))
     assert not offline.try_refresh() and offline.config==config() and not offline.ready
     with pytest.raises(RuntimeError):offline.save_config(config(),revision(offline.config))
+
+def test_hospital_alias_matches_history_name():
+    from app.domain import hospital_name
+    assert hospital_name('부산부민')=='부산부민병원' and hospital_name(' 예손병원 ')=='예손병원' and hospital_name(None)==''
+    hist=[{'ticket_id':1,'completed':True,'summary':'수납 금액 오류','hospital':'부산부민병원'},
+          {'ticket_id':2,'completed':True,'summary':'수납 금액 오류','hospital':'예손병원'}]
+    assert lexical_search('수납 금액 오류',hist,hospital_name('부산부민'))[0]['ticket_id']==1
+
+def test_accuracy_needs_every_recommended_developer_to_match():
+    from app.analytics import category
+    base={'rec_parts':['원무','진료'],'actual_parts':['원무','진료']}
+    assert category({**base,'rec_devs':['김구현','김성지'],'actual_devs':['신승용','김성지']})=='person_change'
+    assert category({**base,'rec_devs':['김성지'],'actual_devs':['신승용','김성지']})=='person_change'
+    assert category({**base,'rec_devs':['신승용','김성지'],'actual_devs':['김성지','신승용']})=='match'
+    assert category({**base,'rec_parts':['보험'],'rec_devs':[],'actual_devs':['신승용']})=='part_error'

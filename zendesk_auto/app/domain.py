@@ -92,6 +92,9 @@ def validate_config(c):
     from .catalog import validate as validate_catalog
     validate_settings(s); validate_catalog(c)
     if not isinstance(s.get('live_writes', False), bool): raise ValueError('실제 접수 설정 오류')
+    if not isinstance(s.get('read_attachments', False), bool): raise ValueError('첨부 확인 설정 오류')
+    from .clients import validate_models
+    validate_models(s)
     # Google Sheets stores settings as one JSON cell (50,000 characters maximum).
     if len(json.dumps(s, ensure_ascii=False)) > 45000: raise ValueError('운영 설정이 너무 큽니다. 지난 젠콜 일정을 정리하세요.')
     return c
@@ -122,6 +125,13 @@ def apply_pre_review_rule(assignments):
 def copy_assignments(assignments):
     import copy
     return copy.deepcopy(assignments)
+
+# Zendesk hospital values that differ from the name used in past tickets. Only pairs confirmed by the operations team.
+HOSPITAL_ALIASES={'부산부민':'부산부민병원'}
+
+def hospital_name(raw):
+    name=str(raw or '').strip()
+    return HOSPITAL_ALIASES.get(name,name)
 
 def lexical_search(text, history, hospital='', limit=5, completed_only=True):
     rows=[]
