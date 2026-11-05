@@ -137,12 +137,14 @@ def session_cookie(response,sid,request):
     return response
 
 @app.get('/auth/login')
-def oauth_start(request:Request):
+def oauth_start(request:Request,intake:int=0):
     o=runtime.oauth()
     if not o:return RedirectResponse('/login',302)
+    # Choosing the intake account is for people who are already logged in.
+    if intake and not runtime.session_user(request.cookies.get(runtime.COOKIE)):return RedirectResponse('/login',302)
     # The state cookie must be set on the same address Zendesk sends the browser back to.
-    if origin(request) not in o['bases']:return RedirectResponse(runtime.site()+'/auth/login',302)
-    url,state=runtime.start(origin(request))
+    if origin(request) not in o['bases']:return RedirectResponse(runtime.site()+'/auth/login'+('?intake=1' if intake else ''),302)
+    url,state=runtime.start(origin(request),bool(intake))
     r=RedirectResponse(url,302)
     r.set_cookie(runtime.STATE_COOKIE,state,max_age=runtime.STATE_SECONDS,httponly=True,samesite='lax',secure=request.url.scheme=='https',path='/auth')
     return r
@@ -150,11 +152,8 @@ def oauth_start(request:Request):
 @app.get('/auth/callback')
 def oauth_callback(request:Request,code:str='',state:str='',error:str=''):
     if error:return RedirectResponse('/login?e=denied',302)
-    # Any running analysis finishes with the account it started with.
-    if not engine.run_lock.acquire(timeout=60):return RedirectResponse('/login?e=busy',302)
-    try:sid,_=runtime.finish(code,state,request.cookies.get(runtime.STATE_COOKIE))
-    except runtime.LoginError as e:return RedirectResponse('/login?e='+(str(e) if str(e) in ('expired','role') else 'failed'),302)
-    finally:engine.run_lock.release()
+    try:sid,_,_=runtime.finish(code,state,request.cookies.get(runtime.STATE_COOKIE),engine.run_lock,request.cookies.get(runtime.COOKIE))
+    except runtime.LoginError as e:return RedirectResponse('/login?e='+(str(e) if str(e) in ('expired','role','busy') else 'failed'),302)
     r=session_cookie(RedirectResponse('/',302),sid,request);r.delete_cookie(runtime.STATE_COOKIE,path='/auth')
     return r
 
@@ -166,12 +165,18 @@ def password_login(body:dict,request:Request):
     return session_cookie(JSONResponse({'ok':True}),sid,request)
 
 @app.post('/auth/logout',dependencies=[Depends(auth)])
-def logout():
-    if not engine.run_lock.acquire(timeout=60):raise HTTPException(409,'분석 완료 후 다시 시도하세요.')
-    try:runtime.logout()
-    finally:engine.run_lock.release()
+def logout(request:Request):
+    """Only this browser; the intake account keeps working."""
+    runtime.end_session(request.cookies.get(runtime.COOKIE))
     r=JSONResponse({'ok':True});r.delete_cookie(runtime.COOKIE)
     return r
+
+@app.post('/api/intake/release',dependencies=[Depends(auth)])
+def release_intake():
+    if not engine.run_lock.acquire(timeout=60):raise HTTPException(409,'분석 완료 후 다시 시도하세요.')
+    try:runtime.release_intake()
+    finally:engine.run_lock.release()
+    return {'ok':True}
 
 def daily_counts(jobs,today,days=14):
     """Tickets per Zendesk creation date (KST) for the last two weeks, zero days included."""
@@ -185,8 +190,8 @@ def daily_counts(jobs,today,days=14):
         r['written']+=j.get('write_status')=='done'
     return [{'date':d,**v} for d,v in sorted(rows.items(),reverse=True)]
 
-@app.get('/api/state',dependencies=[Depends(auth)])
-def state():
+@app.get('/api/state')
+def state(me:dict=Depends(auth)):
     store.try_refresh()
     c=store.config;allowed,why=operating(c)
     day=datetime.now(KST).date().isoformat();live=live_enabled(c)
@@ -205,7 +210,7 @@ def state():
         'history_count':len(store.history),'completed_count':sum(r.get('completed',False) for r in store.history),
         'last_tick':store.state['last_tick'],'last_error':store.state['last_error'],
         'notifications':store.state['notifications'],
-        'login':runtime.public(),
+        'login':{**runtime.public(),'me':me},
         'models':{'options':list(MODELS),'efforts':list(EFFORTS),'env':{'ticket':env_model('ticket'),'image':env_model('pis_schedule'),'effort':os.getenv('ANTHROPIC_EFFORT','low') or 'low'},
             'effective':{'ticket':model_for('ticket',c['settings']),'image':model_for('pis_schedule',c['settings'])}},
         'connections':{'zendesk':engine.z.ready,'claude':bool(os.getenv('ANTHROPIC_API_KEY')),

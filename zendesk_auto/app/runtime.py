@@ -1,9 +1,13 @@
 """Web login, which is also the Zendesk account the server works with.
 
-One login for the whole server: whoever logs in last is the Zendesk account used for lookups and
-intake, and automatic intake keeps using it after the browser is closed. A new login ends the
-previous person's browser session; logging out ends every session and stops intake until someone
-logs in again. Tokens are kept only in secrets/ on this server, never in Google Sheets or the browser.
+Two separate things:
+- Web sessions: any number of agents and admins can be logged in at once, each with their own browser
+  session (secrets/web_sessions.json, only hashes of the session ids). Logging out ends only that session.
+- The intake account: one Zendesk login for the whole server (secrets/zendesk_login.json) that lookups and
+  automatic intake use, also after browsers are closed. It is the first login while nobody holds it, or
+  whoever chooses "set as intake account". Releasing it pauses intake until someone sets it again.
+Tokens are kept only in secrets/ on this server, never in Google Sheets or the browser, and only for the
+intake account: a web-only login revokes its Zendesk token right after checking who the person is.
 
 Without an OAuth client in .env, the old ADMIN_PASSWORD login and ZENDESK_API_TOKEN keep working.
 """
@@ -17,6 +21,7 @@ ACCESS_SECONDS=3600             # Zendesk allows 300..172,800
 REFRESH_SECONDS=90*24*3600      # Zendesk maximum; every refresh issues a new refresh token
 SESSION_SECONDS=12*3600         # browser cookie only; the Zendesk login stays until logout
 STATE_SECONDS=600
+MAX_SESSIONS=50
 COOKIE='easyedge_session';STATE_COOKIE='easyedge_oauth'
 ROLES=('agent','admin')
 # Each must also be allowed on the Zendesk OAuth client, or Zendesk answers "Invalid scope".
@@ -62,8 +67,8 @@ def _saved():
     except (OSError,ValueError):
         return None
 
-def _write(rec):
-    p=path();p.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+def _write(rec,p=None):
+    p=p or path();p.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
     tmp=p.with_suffix('.tmp')
     fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
     with os.fdopen(fd,'w',encoding='utf-8') as f:json.dump(rec,f)
@@ -75,29 +80,53 @@ def _expiry(seconds,default):
 
 # Browser sessions
 
+def _sessions_path():return path().with_name('web_sessions.json')
+
+def _sessions():
+    try:v=json.loads(_sessions_path().read_text(encoding='utf-8'))
+    except (OSError,ValueError):return {}
+    now=time.time()
+    return {k:x for k,x in v.items() if isinstance(x,dict) and x.get('mode')==mode() and x.get('expires',0)>now} if isinstance(v,dict) else {}
+
 def session_user(sid):
-    rec=_saved()
-    if not sid or not rec or not rec.get('sid') or rec.get('session_expires',0)<time.time():return None
-    return rec['user'] if secrets.compare_digest(_hash(sid),rec['sid']) else None
+    x=_sessions().get(_hash(sid)) if sid else None
+    return x['user'] if x else None
+
+def _add_session(user,old_sid=None):
+    """A new browser session; the browser's earlier one, if any, is dropped."""
+    sid=secrets.token_urlsafe(32)
+    with _lock:
+        s=_sessions()
+        if old_sid:s.pop(_hash(old_sid),None)
+        s[_hash(sid)]={'mode':mode(),'expires':time.time()+SESSION_SECONDS,'user':user}
+        for k in sorted(s,key=lambda k:s[k]['expires'])[:-MAX_SESSIONS]:s.pop(k)
+        _write(s,_sessions_path())
+    return sid
+
+def end_session(sid):
+    """Log one browser out. The intake account is not touched."""
+    with _lock:
+        s=_sessions()
+        if s.pop(_hash(sid or ''),None) is not None:_write(s,_sessions_path())
 
 def public():
+    """The intake account, never a token."""
     rec=_saved()
     return {'mode':mode(),'user':rec['user'] if rec else None,'since':rec.get('logged_in_at') if rec else None,
         'subdomain':subdomain()}
 
-def _login(user,tokens=None):
-    """Replace whatever login there was. Returns the new browser session id."""
-    sid=secrets.token_urlsafe(32)
+# The intake account
+
+def _set_intake(user,tokens):
+    """Make this person the intake account and revoke the previous one's token."""
     with _lock:
         old=_saved()
-        rec={'mode':mode(),'sid':_hash(sid),'session_expires':time.time()+SESSION_SECONDS,'user':user,
-            'logged_in_at':time.strftime('%Y-%m-%dT%H:%M:%S%z')}
-        if tokens:rec.update(_tokens(tokens))
+        rec={'mode':mode(),'user':user,'logged_in_at':time.strftime('%Y-%m-%dT%H:%M:%S%z'),**_tokens(tokens)}
         _write(rec)
-    if old and old.get('access_token') and old['access_token']!=rec.get('access_token'):_revoke(old['access_token'])
-    return sid
+    if old and old.get('access_token') and old['access_token']!=rec['access_token']:_revoke(old['access_token'])
 
-def logout():
+def release_intake():
+    """No intake account any more: the token is revoked and intake pauses until someone sets one."""
     with _lock:
         rec=_saved()
         try:path().unlink()
@@ -113,12 +142,13 @@ def password_login(password):
         if len(_failures)>=5:raise LoginError('비밀번호를 여러 번 틀렸습니다. 5분 뒤 다시 시도하세요.')
         if not secrets.compare_digest(str(password or '').encode(),expected.encode()):
             _failures.append(now);raise LoginError('비밀번호가 올바르지 않습니다.')
-    return _login({'name':'관리자','email':'','role':'admin'})
+    return _add_session({'name':'관리자','email':'','role':'admin'})
 
 # Zendesk OAuth (authorization code with PKCE)
 
-def start(base=None):
-    """Zendesk authorization URL and the state value the browser must bring back."""
+def start(base=None,intake=False):
+    """Zendesk authorization URL and the state value the browser must bring back.
+    With intake=True the person becomes the intake account; otherwise only when nobody is."""
     o=oauth()
     if not o:raise LoginError('Zendesk OAuth 클라이언트가 설정되지 않았습니다.')
     state=secrets.token_urlsafe(24);verifier=secrets.token_urlsafe(48)
@@ -127,14 +157,16 @@ def start(base=None):
         now=time.time()
         for k in [k for k,v in _pending.items() if v[1]<now]:_pending.pop(k)
         redirect=site(base)+'/auth/callback'
-        _pending[state]=(verifier,now+STATE_SECONDS,redirect)
+        _pending[state]=(verifier,now+STATE_SECONDS,redirect,bool(intake))
     # Spaces as %20: Zendesk rejects 'read+write' with "Invalid scope".
     query=urlencode({'response_type':'code','client_id':o['client_id'],'redirect_uri':redirect,'scope':scopes(),
         'state':state,'code_challenge':challenge,'code_challenge_method':'S256'},quote_via=quote)
     return f'https://{subdomain()}.zendesk.com/oauth/authorizations/new?{query}',state
 
-def finish(code,state,browser_state):
-    """Exchange the code, check the person is an agent or admin, and make them the server's login."""
+def finish(code,state,browser_state,lock=None,old_sid=None):
+    """Exchange the code, check the person is an agent or admin, and open their web session.
+    Returns (session id, user, became_intake). lock is held while the intake account changes, so a
+    running analysis finishes with the account it started with."""
     o=oauth()
     with _lock:item=_pending.pop(str(state or ''),None)
     # The state must also match this browser's cookie, so nobody can push their login into another browser.
@@ -145,7 +177,15 @@ def finish(code,state,browser_state):
     user=_me(tokens['access_token'])
     if user['role'] not in ROLES:
         _revoke(tokens['access_token']);raise LoginError('role')
-    return _login(user,tokens),user
+    intake=item[3] or _saved() is None
+    if intake and lock is not None and not lock.acquire(timeout=60):
+        _revoke(tokens['access_token']);raise LoginError('busy')
+    try:
+        if intake:_set_intake(user,tokens)
+        else:_revoke(tokens['access_token'])
+        return _add_session(user,old_sid),user,intake
+    finally:
+        if intake and lock is not None:lock.release()
 
 def _tokens(t):
     return {'access_token':t['access_token'],'refresh_token':t.get('refresh_token'),

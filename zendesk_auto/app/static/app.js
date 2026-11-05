@@ -135,7 +135,8 @@ function modelAccountCard(){
   <label>이미지 분석 (배정표 스크린샷·티켓 첨부)${pick('image',info.options,info.env.image)}</label>
   <label>사고량 (Claude 5.x 모델만)${pick('effort',info.efforts,info.env.effort)}</label>
   <p class="help">현재 적용: 티켓 <b>${e(info.effective.ticket)}</b> · 이미지 <b>${e(info.effective.image)}</b>. 저장하면 다음 분석부터 바로 적용되며 서버를 다시 켤 필요가 없습니다. API 키는 계속 .env에서 관리합니다.</p><button class="primary">모델 저장</button></form>
- <div class="pad"><h3>Zendesk 접수 계정</h3>${login.mode==='oauth'?`<p>현재 <b>${e(login.user?.name||'없음')}</b> ${e(login.user?.email||'')} · ${e(login.user?.role||'')}</p><p class="help">웹에 로그인한 Zendesk 계정으로 티켓을 조회·접수합니다. 브라우저를 닫아도 로그아웃 전까지 이 계정으로 자동 접수를 계속하고, 다른 사람이 로그인하면 그 사람 계정으로 바뀝니다. 로그아웃하면 모든 화면의 로그인이 끝나고 다음 로그인 때까지 자동 접수가 멈춥니다. 계정이 바뀌면 접수 사전 점검을 다시 실행하세요.</p>`:`<p class="help">Zendesk 로그인(OAuth)이 아직 설정되지 않아 서버 .env의 API 토큰 계정으로 접수합니다. Zendesk API 토큰은 2027-04-30에 모두 사용 중지되므로 매뉴얼의 'Zendesk 로그인 설정'에 따라 OAuth 클라이언트를 등록하세요.</p>`}</div></div>`)}
+ <div class="pad"><h3>Zendesk 접수 계정</h3>${login.mode==='oauth'?`<p>접수 계정: <b>${e(login.user?.name||'없음 (자동 접수 멈춤)')}</b> ${e(login.user?.email||'')} · ${e(login.user?.role||'')}${login.user&&login.user.id===login.me.id?' · <b>내 계정</b>':''}</p><p>내 로그인: <b>${e(login.me.name)}</b></p><p class="help">웹 로그인과 접수 계정은 별개입니다. 여러 사람이 동시에 로그인해 화면을 볼 수 있고, 로그아웃해도 접수 계정은 그대로 자동 접수를 계속합니다. 접수 계정은 서버에 한 명만 둘 수 있으며, 처음 로그인한 사람이 맡거나 아래 버튼으로 바꿉니다. 바뀌면 접수 사전 점검을 다시 실행하세요.</p>
+  <div>${login.user&&login.user.id===login.me.id?'':'<a class="button primary" href="/auth/login?intake=1">내 계정을 접수 계정으로 지정</a>'}${login.user?'<button data-release-intake="1">자동 접수 멈추기 (접수 계정 해제)</button>':''}</div></p>`:`<p class="help">Zendesk 로그인(OAuth)이 아직 설정되지 않아 서버 .env의 API 토큰 계정으로 접수합니다. Zendesk API 토큰은 2027-04-30에 모두 사용 중지되므로 매뉴얼의 'Zendesk 로그인 설정'에 따라 OAuth 클라이언트를 등록하세요.</p>`}</div></div>`)}
 function collectOptions(){document.querySelectorAll('#option-table [data-opt]').forEach(i=>{const v=i.value.trim(),n=i.dataset.name;if(i.dataset.opt==='part')conf.settings.parts.find(p=>p.name===n).option_value=v;if(i.dataset.opt==='dev')conf.agents.find(a=>a.name===n).option_value=v;if(i.dataset.opt==='pis'){conf.settings.pis_members=pisMembers().map(m=>m.name===n?{...m,option_value:v}:m)}})}
 
 // ---------- events
@@ -145,6 +146,7 @@ document.addEventListener('click',async ev=>{const b=ev.target.closest('button')
  if(b.dataset.place!==undefined){const i=Number(b.dataset.place),date=document.querySelector(`[data-place-date="${i}"]`).value;if(!date)throw Error('날짜를 고르세요.');pisDraft[date]=draftFrom(pisUnresolved[i]);pisUnresolved.splice(i,1);calendarDate=new Date(date+'T12:00:00');await calendar();return}
  if(b.dataset.verify){const r=await api('/jobs/'+b.dataset.verify+'/write-verify',{});toast({done:'반영을 확인했습니다.',failed:'반영되지 않았습니다. 재분석할 수 있습니다.'}[r.status]||'아직 확인할 수 없습니다. Zendesk에서 직접 확인하세요.');await load();return}
  if(b.dataset.testwrite){if(!confirm(`#${b.dataset.testwrite} 티켓을 실제로 접수합니다. 양식·관련파트·운영팀 담당자·상태를 바꾸고 공개 안내 댓글을 등록합니다.`))return;const r=await api('/jobs/'+b.dataset.testwrite+'/test-write',{});toast(r.write_status==='done'?'접수했습니다. Zendesk에서 확인하세요.':'접수하지 않았습니다: '+(r.reason||r.write_status));await load();return}
+ if(b.dataset.releaseIntake){if(!confirm('접수 계정을 해제하면 누군가 접수 계정으로 지정할 때까지 자동 접수가 멈춥니다. 계속할까요?'))return;await api('/intake/release',{});toast('접수 계정을 해제했습니다. 자동 접수가 멈췄습니다.');await load();return}
  if(b.dataset.retry){await api('/jobs/'+b.dataset.retry+'/retry',{});toast('다음 분석 주기에 다시 확인합니다.');await load();return}
  if(b.dataset.removeDate){conf.calendar=conf.calendar.filter(x=>x.date!==b.dataset.removeDate);await save();return}
  if(b.dataset.removeAbsence){conf.settings.absences=(conf.settings.absences||[]).filter(x=>x.id!==b.dataset.removeAbsence);await save();return}
@@ -196,5 +198,5 @@ document.addEventListener('change',ev=>{const t=ev.target;
   if(t.dataset.work!==undefined){const w=conf.settings.work_mappings[Number(t.dataset.work)];w[t.dataset.k]=t.type==='checkbox'?t.checked:t.value;catalogDirty=true;catalog()}
  }catch(err){toast(err.message);catalog()}});
 $('#refresh').addEventListener('click',()=>load().catch(x=>toast(x.message)));
-$('#logout').addEventListener('click',async()=>{if(!confirm(state?.login?.mode==='oauth'?'로그아웃하면 모든 화면의 로그인이 끝나고, 누군가 다시 로그인할 때까지 자동 접수가 멈춥니다.':'로그아웃합니다.'))return;try{await fetch('/auth/logout',{method:'POST',headers:{'X-Requested-With':'zendesk-admin'}})}finally{location.href='/login'}});
+$('#logout').addEventListener('click',async()=>{if(!confirm(state?.login?.mode==='oauth'?'이 브라우저만 로그아웃합니다. 접수 계정과 자동 접수는 그대로입니다.':'로그아웃합니다.'))return;try{await fetch('/auth/logout',{method:'POST',headers:{'X-Requested-With':'zendesk-admin'}})}finally{location.href='/login'}});
 load().catch(err=>{$('#content').innerHTML=empty('서버 연결을 확인해 주세요',err.message)});

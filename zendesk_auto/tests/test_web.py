@@ -101,13 +101,13 @@ def test_models_from_screen_override_env(monkeypatch):
 
 H2={'X-Requested-With':'zendesk-admin'}
 
-def test_password_login_one_session_and_logout():
+def test_password_login_many_sessions_logout_ends_only_one():
     first=logged_in();second=logged_in()
-    # A new login ends the earlier browser session.
-    assert first.get('/api/state').status_code==401 and second.get('/api/state').status_code==200
+    # Both stay logged in; logging out ends only the browser that asked.
+    assert first.get('/api/state').status_code==200 and second.get('/api/state').status_code==200
     assert TestClient(app).post('/auth/password',json={'password':'wrong'},headers=H2).status_code==401
     assert second.post('/auth/logout',headers=H2).status_code==200
-    assert second.get('/api/state').status_code==401
+    assert second.get('/api/state').status_code==401 and first.get('/api/state').status_code==200
 
 def test_zendesk_login_is_the_intake_account(monkeypatch,tmp_path):
     import time
@@ -117,7 +117,7 @@ def test_zendesk_login_is_the_intake_account(monkeypatch,tmp_path):
     monkeypatch.setenv('SECRETS_DIR',str(tmp_path))
     monkeypatch.setenv('ZENDESK_OAUTH_CLIENT_ID','easyedge');monkeypatch.setenv('ZENDESK_OAUTH_CLIENT_SECRET','client-secret')
     monkeypatch.setenv('PUBLIC_URL','https://easyedge.example')
-    calls=[];people={'tok-1':{'id':1,'name':'김상담','email':'a@example.com','role':'agent'},'tok-2':{'id':2,'name':'고객','email':'c@example.com','role':'end-user'}}
+    calls=[];people={'tok-1':{'id':1,'name':'김상담','email':'a@example.com','role':'agent'},'tok-2':{'id':2,'name':'고객','email':'c@example.com','role':'end-user'},'tok-3':{'id':3,'name':'박상담','email':'b@example.com','role':'agent'}}
     def token_request(payload):
         calls.append(payload)
         if payload['grant_type']=='refresh_token':
@@ -141,25 +141,39 @@ def test_zendesk_login_is_the_intake_account(monkeypatch,tmp_path):
     assert c.get('/auth/callback?code=code-1&state=forged',follow_redirects=False).headers['location']=='/login?e=expired'
     c,r=login('code-2')                                    # customers cannot log in
     assert r.headers['location']=='/login?e=role' and revoked==['tok-2'] and not engine.z.ready
-    c,r=login('code-1')
+    c,r=login('code-1')                                    # first login while nobody holds intake: becomes the intake account
     assert r.headers['location']=='/' and 'secure' in r.headers['set-cookie'].lower()
     assert calls[-1]['code_verifier'] and calls[-1]['expires_in']==3600
     assert oct(runtime.path().stat().st_mode)[-3:]=='600' and engine.z.ready
     state=c.get('/api/state').json()
-    assert state['login']['user']['name']=='김상담' and 'tok-1' not in json.dumps(state) and 'ref' not in json.dumps(state['login'])
+    assert state['login']['user']['name']=='김상담' and state['login']['me']['name']=='김상담'
+    assert 'tok-1' not in json.dumps(state) and 'ref' not in json.dumps(state['login'])
     assert TestClient(app).get('/auth/info').json()=={'mode':'oauth','subdomain':'edgennext','current':'김상담','intake_paused':False}
+    # A second person logs in at the same time: both sessions work, the intake account stays, their token is revoked.
+    d,r=login('code-3')
+    assert r.headers['location']=='/' and revoked[-1]=='tok-3'
+    assert c.get('/api/state').status_code==200 and d.get('/api/state').json()['login']['me']['name']=='박상담'
+    assert d.get('/api/state').json()['login']['user']['name']=='김상담' and runtime.access_token()=='tok-1'
+    # Choosing the intake account needs a login; then the previous token is revoked.
+    assert TestClient(app,base_url='https://easyedge.example').get('/auth/login?intake=1',follow_redirects=False).headers['location']=='/login'
+    r=d.get('/auth/login?intake=1',follow_redirects=False);q=parse_qs(urlparse(r.headers['location']).query)
+    r=d.get(f"/auth/callback?code=code-3&state={q['state'][0]}",follow_redirects=False)
+    assert d.get('/api/state').json()['login']['user']['name']=='박상담' and revoked[-1]=='tok-1' and runtime.access_token()=='tok-3'
+    assert c.get('/api/state').status_code==200
     # Shortly before expiry the token is refreshed and saved.
     rec=json.loads(runtime.path().read_text());rec['expires_at']=time.time();runtime._write(rec)
     assert runtime.access_token()=='tok-1b' and json.loads(runtime.path().read_text())['refresh_token']=='ref-1b'
-    # A refresh Zendesk rejects ends the login.
+    # A refresh Zendesk rejects releases the intake account; web sessions stay.
     rec=json.loads(runtime.path().read_text());rec.update(expires_at=time.time(),refresh_token='dead');runtime._write(rec)
     import pytest
     with pytest.raises(runtime.LoginError,match='만료'):runtime.access_token()
-    assert not engine.z.ready and c.get('/api/state').status_code==401
-    # Logout everywhere: token revoked, sessions gone, intake paused.
-    c,r=login('code-1');other=TestClient(app,base_url='https://easyedge.example');other.cookies.set(runtime.COOKIE,c.cookies.get(runtime.COOKIE))
-    assert c.post('/auth/logout',headers=H2).status_code==200
-    assert revoked[-1]=='tok-1' and other.get('/api/state').status_code==401 and not engine.z.ready
+    assert not engine.z.ready and c.get('/api/state').status_code==200
+    # Logout ends only that browser and leaves intake alone; releasing the intake account pauses it.
+    e,r=login('code-1')                                    # nobody holds intake again, so this one takes it
+    assert engine.z.ready and e.post('/auth/logout',headers=H2).status_code==200
+    assert e.get('/api/state').status_code==401 and c.get('/api/state').status_code==200 and engine.z.ready
+    assert c.post('/api/intake/release',headers=H2).status_code==200
+    assert revoked[-1]=='tok-1' and not engine.z.ready and c.get('/api/state').status_code==200
     assert TestClient(app).get('/auth/info').json()['intake_paused'] is True
 
 def test_zendesk_calls_use_the_logged_in_token(monkeypatch,tmp_path):
