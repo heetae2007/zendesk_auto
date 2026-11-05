@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>이지엣지 아키텍처</title>
+<style>
+:root{--bg:#f7f5f0;--surface:#fffdf8;--ink:#1c1b19;--mute:#6d6a62;--line:#c9c4b8;--accent:#b5452a;--accent-bg:#f8e9e3;--band:#efece4}
+@media (prefers-color-scheme:dark){:root{--bg:#161512;--surface:#1f1d19;--ink:#ece8de;--mute:#9a9588;--line:#3b3832;--accent:#e0775a;--accent-bg:#2c1e19;--band:#1a1814}}
+*{box-sizing:border-box}
+body{margin:0;padding:24px 16px 40px;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI","Noto Sans KR","Malgun Gothic",sans-serif}
+main{max-width:1200px;margin:0 auto}
+h1{font-size:22px;font-weight:600;margin:0 0 4px}
+p.sub{margin:0 0 20px;color:var(--mute);font-size:14px}
+svg{display:block;width:100%;height:auto}
+.band{fill:var(--band);stroke:var(--line);stroke-width:1}
+.box{fill:var(--surface);stroke:var(--line);stroke-width:1}
+.hot{fill:var(--accent-bg);stroke:var(--accent);stroke-width:1}
+.t{fill:var(--ink);font-size:13px;font-weight:600;text-anchor:middle}
+.s{fill:var(--mute);font-size:11px;text-anchor:middle}
+.m{fill:var(--mute);font-size:10px;font-family:ui-monospace,Menlo,Consolas,monospace;text-anchor:middle}
+.lab{fill:var(--mute);font-size:11px}
+.cap{fill:var(--mute);font-size:11px;font-weight:600;letter-spacing:.04em}
+.hot-t{fill:var(--accent)}
+.ln{stroke:var(--ink);stroke-width:1;fill:none}
+.ln-a{stroke:var(--accent);stroke-width:1.2;fill:none}
+.dash{stroke-dasharray:4 3}
+ul.legend{list-style:none;padding:0;margin:16px 0 0;display:flex;flex-wrap:wrap;gap:6px 20px;color:var(--mute);font-size:12px}
+ul.legend b{color:var(--accent);font-weight:600}
+</style>
+</head>
+<body>
+<main>
+<h1>이지엣지 아키텍처</h1>
+<p class="sub">Zendesk 신규 문의를 1분마다 조회 → Claude 분석 → 기준표로 담당자 정함 → 당일 젠콜 PIS 1명 배정 → Telegram 알림·Zendesk 접수</p>
+
+<svg viewBox="0 0 1200 830" role="img" aria-label="이지엣지 시스템 구성도: 브라우저 6개 탭, FastAPI 서버(OAuth 로그인, 접수 파이프라인), 외부 서비스(Zendesk, Claude, Telegram, Google Sheets)">
+<defs>
+<marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M1 1L9 5L1 9" fill="none" stroke="var(--ink)" stroke-width="1.4"/></marker>
+<marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M1 1L9 5L1 9" fill="none" stroke="var(--accent)" stroke-width="1.4"/></marker>
+</defs>
+
+<!-- 브라우저 -->
+<rect class="band" x="40" y="30" width="1120" height="140" rx="8"/>
+<text class="cap" x="56" y="52">브라우저 · app/static (index.html · app.js)</text>
+<rect class="hot" x="60" y="70" width="140" height="80" rx="6"/>
+<text class="t hot-t" x="130" y="100">로그인</text>
+<text class="s" x="130" y="120">Zendesk 계정</text>
+<text class="s" x="130" y="136">(상담원·관리자)</text>
+
+<g>
+<rect class="box" x="230" y="70" width="138" height="80" rx="6"/><text class="t" x="299" y="98">01 접수 현황</text><text class="s" x="299" y="118">티켓 상태·PIS</text><text class="s" x="299" y="134">재분석·결과 확인</text>
+<rect class="box" x="380" y="70" width="138" height="80" rx="6"/><text class="t" x="449" y="98">02 운영 달력</text><text class="s" x="449" y="118">젠콜 call 1~3</text><text class="s" x="449" y="134">부재·휴일·예외일</text>
+<rect class="box" x="530" y="70" width="138" height="80" rx="6"/><text class="t" x="599" y="98">03 업무·담당 기준</text><text class="s" x="599" y="118">파트→세부업무</text><text class="s" x="599" y="134">→ 개발·PIS 담당</text>
+<rect class="box" x="680" y="70" width="138" height="80" rx="6"/><text class="t" x="749" y="98">04 추천 테스트</text><text class="s" x="749" y="118">가상 문의 시뮬</text><text class="s" x="749" y="134">(Zendesk 미접촉)</text>
+<rect class="box" x="830" y="70" width="138" height="80" rx="6"/><text class="t" x="899" y="98">05 검토·정확도</text><text class="s" x="899" y="118">XLSX 비교</text><text class="s" x="899" y="134">개선·변경 제안</text>
+<rect class="box" x="980" y="70" width="138" height="80" rx="6"/><text class="t" x="1049" y="98">06 연결 및 설정</text><text class="s" x="1049" y="118">스위치·Claude 모델</text><text class="s" x="1049" y="134">필드 매핑·점검</text>
+</g>
+
+<!-- 브라우저 → 서버 -->
+<path class="ln-a" d="M130 150V250" marker-end="url(#ar)"/>
+<text class="lab hot-t" x="138" y="200">OAuth 로그인</text>
+<path class="ln" d="M600 150V215" marker-end="url(#a)"/>
+<text class="lab" x="608" y="190">HTTPS · 세션 쿠키 · /api/*</text>
+
+<!-- 서버 -->
+<rect class="band" x="40" y="215" width="1120" height="400" rx="8"/>
+<text class="cap" x="56" y="237">서버 · FastAPI (app/) — uvicorn --workers 1, data/instance.lock</text>
+
+<rect class="box" x="60" y="250" width="230" height="80" rx="6"/>
+<text class="t" x="175" y="276">main.py</text>
+<text class="m" x="175" y="294">/auth/* · /api/*</text>
+<text class="s" x="175" y="314">세션 확인 후 6개 탭에 응답</text>
+
+<rect class="hot" x="60" y="350" width="230" height="130" rx="6"/>
+<text class="t hot-t" x="175" y="376">runtime.py · Zendesk OAuth</text>
+<text class="s" x="175" y="398">웹 세션: 여러 명 동시 · 쿠키(해시만 저장)</text>
+<text class="s" x="175" y="416">접수 계정: 서버에 1명 (토큰 secrets/)</text>
+<text class="s" x="175" y="434">액세스 1시간 · 만료 5분 전 자동 갱신</text>
+<text class="s" x="175" y="452">scope: read tickets:write</text>
+<text class="s" x="175" y="470">갱신 거부 시 접수 계정 해제</text>
+
+<rect class="box" x="60" y="500" width="230" height="90" rx="6"/>
+<text class="t" x="175" y="526">store.py</text>
+<text class="s" x="175" y="546">설정 → Google Sheets</text>
+<text class="s" x="175" y="562">이력·배정 → data/</text>
+<text class="s" x="175" y="578">연결 실패 시 config.json 사본</text>
+
+<!-- 파이프라인 -->
+<text class="t" x="350" y="265" style="text-anchor:start">engine.py — 1분마다 tick (운영 시간 평일 09~18시 · 공휴일 제외)</text>
+
+<rect class="box" x="350" y="285" width="134" height="140" rx="6"/>
+<text class="m" x="417" y="305">① clients.py</text><text class="t" x="417" y="326">신규 조회</text>
+<text class="s" x="417" y="348">Zendesk 신규 티켓</text><text class="s" x="417" y="364">+ 비슷한 과거 사례</text><text class="s" x="417" y="380">(처리 개발자 포함)</text>
+
+<rect class="box" x="502" y="285" width="134" height="140" rx="6"/>
+<text class="m" x="569" y="305">② clients.py</text><text class="t" x="569" y="326">Claude 분석</text>
+<text class="s" x="569" y="348">요약 · 파트</text><text class="s" x="569" y="364">세부업무 선택</text><text class="s" x="569" y="380">사람은 고르지 않음</text>
+
+<rect class="box" x="654" y="285" width="134" height="140" rx="6"/>
+<text class="m" x="721" y="305">③ work_mapping</text><text class="t" x="721" y="326">개발 담당자</text>
+<text class="s" x="721" y="348">세부업무 주담당</text><text class="s" x="721" y="364">→ 백업·파트 기본</text><text class="s" x="721" y="380">→ 과거 처리자</text>
+
+<rect class="hot" x="806" y="285" width="134" height="140" rx="6"/>
+<text class="m hot-t" x="873" y="305">④ pis.py</text><text class="t hot-t" x="873" y="326">PIS 젠콜 배정</text>
+<text class="s" x="873" y="348">당일 젠콜 중 1명</text><text class="s" x="873" y="364">비율 대비 부족한 사람</text><text class="s" x="873" y="380">밀린 티켓은 묶음 배정</text>
+
+<rect class="box" x="958" y="285" width="134" height="140" rx="6"/>
+<text class="m" x="1025" y="305">⑤ zendesk_write</text><text class="t" x="1025" y="326">알림 · 접수</text>
+<text class="s" x="1025" y="348">Telegram 알림</text><text class="s" x="1025" y="364">Zendesk 반영</text><text class="s" x="1025" y="380">(실제 접수 ON일 때)</text>
+
+<path class="ln" d="M484 355H502" marker-end="url(#a)"/>
+<path class="ln" d="M636 355H654" marker-end="url(#a)"/>
+<path class="ln" d="M788 355H806" marker-end="url(#a)"/>
+<path class="ln" d="M940 355H958" marker-end="url(#a)"/>
+
+<!-- 검토 필요 -->
+<rect class="box dash" x="620" y="445" width="370" height="50" rx="6"/>
+<text class="t" x="805" y="466">검토 필요</text>
+<text class="s" x="805" y="483">분석 3회 실패 · 젠콜 없음 · 과거 처리자 사용 → Zendesk 변경 안 함</text>
+<path class="ln dash" d="M721 425V445"/>
+<path class="ln dash" d="M873 425V445"/>
+
+<!-- 보조 모듈 -->
+<rect class="box" x="585" y="515" width="130" height="75" rx="6"/>
+<text class="m" x="650" y="535">analytics.py</text><text class="s" x="650" y="555">05 검토·정확도</text><text class="s" x="650" y="571">XLSX 첫 추천 비교</text>
+<rect class="box" x="725" y="515" width="130" height="75" rx="6"/>
+<text class="m" x="790" y="535">/api/simulate</text><text class="s" x="790" y="555">04 추천 테스트</text><text class="s" x="790" y="571">읽기·쓰기 안 함</text>
+<rect class="box" x="865" y="515" width="130" height="75" rx="6"/>
+<text class="m" x="930" y="535">접수 안전장치</text><text class="s" x="930" y="555">직전 티켓 재조회</text><text class="s" x="930" y="571">safe_update 409</text>
+
+<!-- 서버 → 외부 -->
+<text class="cap" x="40" y="672">외부 서비스</text>
+
+<path class="ln-a" d="M290 415H315V690" marker-end="url(#ar)"/>
+<text class="lab hot-t" x="323" y="672">OAuth·토큰</text>
+
+<path class="ln" d="M417 425V690" marker-end="url(#a)"/>
+<text class="lab" x="423" y="672">조회</text>
+
+<path class="ln" d="M569 425V690" marker-end="url(#a)"/>
+<text class="lab" x="575" y="672">분석 요청</text>
+
+<path class="ln" d="M1025 425V690" marker-end="url(#a)"/>
+<text class="lab" x="1031" y="672">알림</text>
+
+<path class="ln-a dash" d="M1092 355H1110V655H500V690" marker-end="url(#ar)"/>
+<text class="lab hot-t" x="1100" y="648" style="text-anchor:end">접수 반영 (ALLOW_LIVE_WRITES + 웹 설정)</text>
+
+<path class="ln" d="M175 590V690" marker-end="url(#a)"/>
+<text class="lab" x="181" y="672">설정·이력</text>
+
+<!-- 외부 박스 -->
+<rect class="box" x="60" y="690" width="220" height="110" rx="6"/>
+<text class="t" x="170" y="718">Google Sheets</text>
+<text class="s" x="170" y="740">Settings · Agents · Calendar 탭</text>
+<text class="s" x="170" y="758">기준표 · 젠콜 · 부재 · 운영 설정</text>
+<text class="s" x="170" y="776">+ 서버 data/ (실행·배정 이력)</text>
+
+<rect class="box" x="300" y="690" width="240" height="110" rx="6"/>
+<text class="t" x="420" y="718">Zendesk</text>
+<text class="s" x="420" y="740">OAuth 로그인 · 신규 티켓 검색</text>
+<text class="s" x="420" y="758">양식·관련파트·운영팀 담당자·상태</text>
+<text class="s" x="420" y="776">공개 접수 안내 등록</text>
+
+<rect class="box" x="560" y="690" width="240" height="110" rx="6"/>
+<text class="t" x="680" y="718">Claude API (Anthropic)</text>
+<text class="s" x="680" y="740">티켓 분석 · 프롬프트 캐시</text>
+<text class="s" x="680" y="758">배정표 스크린샷·첨부 이미지 분석</text>
+<text class="s" x="680" y="776">모델은 06 탭에서 선택</text>
+
+<rect class="box" x="900" y="690" width="260" height="110" rx="6"/>
+<text class="t" x="1030" y="718">Telegram</text>
+<text class="s" x="1030" y="740">[병원명] 파트 개발담당자 /</text>
+<text class="s" x="1030" y="758">PIS 담당자 + 문의 요약 · 티켓 번호</text>
+<text class="s" x="1030" y="776">테스트 메시지에는 [테스트] 표시</text>
+</svg>
+
+<ul class="legend">
+<li><b>주황</b> Zendesk OAuth 로그인 · PIS 젠콜 배정 · 접수 반영 경로</li>
+<li>실선: 항상 동작 · 점선: 조건부(검토 필요 분기, 실제 접수)</li>
+<li>기본값은 추천 전용 — 실제 Zendesk 변경은 환경변수와 웹 설정이 모두 켜졌을 때만</li>
+</ul>
+</main>
+</body>
+</html>
