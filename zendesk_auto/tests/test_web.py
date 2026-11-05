@@ -69,22 +69,9 @@ def test_retry_refuses_after_uncertain_write():
     r=logged_in().post('/api/jobs/77/retry',json={},headers=H)
     assert r.status_code==409
 
-def test_work_mapping_import_ignores_parts_outside_catalogue():
-    from io import BytesIO
-    from openpyxl import Workbook
-    from app.main import store
-    store.config['settings']['parts']=[{'name':'보험','active':True,'option_value':'','developer':'','developer_backup':'','pis':'','pis_backup':''}]
-    wb=Workbook();s=wb.active
-    s.append(['','메뉴','','담당자','1차백업','담당자','1차백업'])
-    s.append(['','보험','심사','채희태','이정기','노주영','이혜경'])
-    s.append(['','수납','수납관리','김구현','','',''])
-    buf=BytesIO();wb.save(buf)
-    r=logged_in().post('/api/work-mapping/import',files={'file':('m.xlsx',buf.getvalue(),'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')},headers=H)
-    assert r.status_code==200 and [x['work'] for x in r.json()['rows']]==['심사'] and r.json()['ignored']==['수납']
-
 def test_removed_endpoints_are_gone():
     paths={r.path for r in app.routes}
-    assert not {'/api/import','/api/analytics/review/{tid}','/api/pis/preview','/api/pis/backlog-preview'}&paths
+    assert not {'/api/import','/api/analytics/review/{tid}','/api/pis/preview','/api/pis/backlog-preview','/api/work-mapping/import'}&paths
 
 def test_models_from_screen_override_env(monkeypatch):
     from app.clients import model_for, effort_for

@@ -14,7 +14,6 @@ from .engine import Engine
 from .importer import import_xlsx
 from .analytics import Analytics
 from .telegram_format import format_notification
-from .work_mapping import parse_workbook
 from .pis import members,active_names,on_call,counts as pis_counts,normalize_schedule,prune_days
 from .zendesk_write import live_enabled,preflight,suggest,expected_people,test_mode
 from .catalog import unknown_people
@@ -265,18 +264,6 @@ def retry(tid:int):
     try:t=engine.z.ticket(tid)
     except Exception:raise HTTPException(503,'티켓 재조회 실패')
     store.set_job(tid,status='queued',attempts=0,source_updated_at=t['updated_at']);return {'ok':True}
-
-@app.post('/api/work-mapping/import',dependencies=[Depends(auth)])
-async def import_work_mapping(file:UploadFile=File(...)):
-    data=await file.read(20*1024*1024+1)
-    if len(data)>20*1024*1024:raise HTTPException(413,'20MB 이하 파일을 사용하세요.')
-    try:
-        with zipfile.ZipFile(BytesIO(data)) as z:
-            if sum(x.file_size for x in z.infolist())>100*1024*1024:raise ValueError('압축 해제 용량 초과')
-        rows=parse_workbook(data);known={p['name'] for p in store.config['settings'].get('parts',[])}
-        # Rows under parts outside the catalogue are ignored by decision (e.g. 수납/환자관리/배치).
-        return {'rows':[r for r in rows if r['part'] in known],'ignored':sorted({r['part'] for r in rows if r['part'] not in known})}
-    except Exception:raise HTTPException(400,'업무 엑셀을 읽지 못했습니다. 파일과 양식을 확인하세요.')
 
 @app.post('/api/simulate',dependencies=[Depends(auth)])
 def simulate(body:dict):
