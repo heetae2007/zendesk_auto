@@ -30,6 +30,13 @@ def category(case):
     if actual_devs and rec_devs!=actual_devs:return 'person_change'
     return 'match'
 
+def dev_score(case):
+    """Partial credit for people: the share of the people who actually handled the ticket that the AI also named.
+    A wrong part scores 0; a ticket with no recorded handler counts as fully right."""
+    if case.get('category')=='part_error':return 0.0
+    actual=set(case.get('actual_devs',[]))
+    return len(actual&set(case.get('rec_devs',[])))/len(actual) if actual else 1.0
+
 class Analytics:
     def __init__(self,store):
         self.store=store;self.lock=threading.RLock()
@@ -112,13 +119,13 @@ class Analytics:
         scored=self.scored();by={}
         for x in scored:
             v=by.setdefault(x['prompt_version'],{'cases':0,'part_ok':0,'dev_ok':0})
-            v['cases']+=1;v['part_ok']+=x['category']!='part_error';v['dev_ok']+=x['category']=='match'
+            v['cases']+=1;v['part_ok']+=x['category']!='part_error';v['dev_ok']+=dev_score(x)
         rate=lambda n,d:round(n/d*100,1) if d else None
         known=[u for u in self.usage if u.get('input_tokens') is not None and u.get('output_tokens') is not None]
         return {'imported':len(self.cases),'scored':len(scored),
             'categories':dict(Counter(x['category'] for x in self.cases.values() if not x.get('excluded'))),
             'part_accuracy':rate(sum(x['category']!='part_error' for x in scored),len(scored)),
-            'dev_accuracy':rate(sum(x['category']=='match' for x in scored),len(scored)),
+            'dev_accuracy':rate(sum(dev_score(x) for x in scored),len(scored)),
             'pis_changed':sum(1 for x in scored if x.get('pis_changed')),
             'by_version':[{'version':k,**v,'part_accuracy':rate(v['part_ok'],v['cases']),'dev_accuracy':rate(v['dev_ok'],v['cases'])} for k,v in sorted(by.items())],
             'usage_requests':len(self.usage),'usage_known':len(known),

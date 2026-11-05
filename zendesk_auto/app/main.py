@@ -310,8 +310,8 @@ def analytics_dashboard(query:str=''):
         order={'part_error':0,'person_change':1,'match':2,'no_actual':3,'no_decision':4}
         cases.sort(key=lambda c:(order.get(c['category'],5),-c['ticket_id']))
         return {'summary':analytics.summary(),'cases':copy.deepcopy(cases),'total_matches':len(cases),'suggestions':analytics.suggestions(),
-            'usage':copy.deepcopy(analytics.usage[-200:][::-1]),'daily_usage':analytics.daily_usage(),'prompts':copy.deepcopy(analytics.prompts[-30:][::-1]),
-            'active_prompt':'base-0.11-catalog'+('+'+str(store.config['settings']['prompt_improvement']['id']) if store.config['settings'].get('prompt_improvement') else '')}
+            'usage':copy.deepcopy(analytics.usage[-200:][::-1]),'daily_usage':analytics.daily_usage(),'prompts':[{**copy.deepcopy(p),'no':i+1} for i,p in enumerate(analytics.prompts)][-30:][::-1],
+            'active_prompt_id':(store.config['settings'].get('prompt_improvement') or {}).get('id')}
 
 @app.post('/api/analytics/import',dependencies=[Depends(auth)])
 async def analytics_import(file:UploadFile=File(...)):

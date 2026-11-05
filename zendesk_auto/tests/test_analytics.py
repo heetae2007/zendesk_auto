@@ -80,3 +80,11 @@ def test_incomplete_tickets_are_not_scored(an):
     an.import_cases([row(1,['보험'],['채희태'],completed=False)])
     assert an.summary()['scored']==0
     with pytest.raises(ValueError):an.propose()
+
+
+def test_dev_score_gives_partial_credit():
+    from app.analytics import dev_score
+    base={'category':'person_change','actual_devs':['A','B','C','D']}
+    assert dev_score({**base,'rec_devs':['A','B','C','E']})==0.75
+    assert dev_score({**base,'rec_devs':['A','B','C','D']})==1.0
+    assert dev_score({**base,'category':'part_error','rec_devs':['A']})==0.0
