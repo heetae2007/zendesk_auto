@@ -322,8 +322,8 @@ def analytics_dashboard(query:str=''):
             cases=[c for c in cases if q in str(c['ticket_id']) or q in (c.get('hospital') or '').casefold()]
         order={'part_error':0,'person_change':1,'match':2,'no_actual':3,'no_decision':4}
         cases.sort(key=lambda c:(order.get(c['category'],5),-c['ticket_id']))
-        return {'summary':analytics.summary(),'cases':copy.deepcopy(cases[:250]),'total_matches':len(cases),'suggestions':analytics.suggestions(),
-            'usage':copy.deepcopy(analytics.usage[-200:][::-1]),'prompts':copy.deepcopy(analytics.prompts[-30:][::-1]),
+        return {'summary':analytics.summary(),'cases':copy.deepcopy(cases),'total_matches':len(cases),'suggestions':analytics.suggestions(),
+            'usage':copy.deepcopy(analytics.usage[-200:][::-1]),'daily_usage':analytics.daily_usage(),'prompts':copy.deepcopy(analytics.prompts[-30:][::-1]),
             'active_prompt':'base-0.11-catalog'+('+'+str(store.config['settings']['prompt_improvement']['id']) if store.config['settings'].get('prompt_improvement') else '')}
 
 @app.post('/api/analytics/import',dependencies=[Depends(auth)])
@@ -338,7 +338,7 @@ async def analytics_import(file:UploadFile=File(...)):
         if not rows:raise ValueError('티켓번호 열과 데이터를 찾을 수 없습니다.')
         # One upload feeds both the similar-case search and the comparison with past auto-recommendations.
         store.import_history(rows)
-        return {'file':report,'comparison':analytics.import_cases(rows)}
+        return {'file':report,'comparison':analytics.import_cases(rows,(file.filename or '')[:200])}
     except Exception as e:raise HTTPException(400,'평가 파일 가져오기 실패: '+type(e).__name__)
 
 @app.post('/api/analytics/exclude/{tid}',dependencies=[Depends(auth)])

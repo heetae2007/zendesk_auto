@@ -1,11 +1,25 @@
 """Usage records and automatic comparison of past auto-recommendations with what actually happened."""
 import copy, threading, uuid
+from datetime import datetime
 from collections import Counter
 from .store import atomic_json,stamp
-from .domain import redact
+from .domain import redact,KST
 from .pis import members
 
 BASE_VERSION='base-0.4'
+# USD per million tokens (platform.claude.com pricing): input, 5-minute cache write, cache read, output.
+# Haiku 5.5 charges more when the whole prompt (input + cache read + cache write) is over 100,000 tokens.
+PRICES={'claude-haiku-5-5':[(100_000,(0.10,0.125,0.01,0.50)),(None,(0.50,0.625,0.05,2.50))],
+    'claude-sonnet-5-5':[(None,(2.0,2.5,0.10,10.0))],'claude-sonnet-4-6':[(None,(3.0,3.75,0.30,15.0))]}
+
+def cost(u):
+    """USD for one Claude call, or None when its tokens or its model's price are not known."""
+    tiers=PRICES.get(u.get('model'))
+    if not tiers or u.get('input_tokens') is None or u.get('output_tokens') is None:return None
+    read,write=u.get('cache_read_input_tokens') or 0,u.get('cache_creation_input_tokens') or 0
+    prompt=u['input_tokens']+read+write
+    rate=next(r for limit,r in tiers if limit is None or prompt<=limit)
+    return (u['input_tokens']*rate[0]+write*rate[1]+read*rate[2]+u['output_tokens']*rate[3])/1_000_000
 
 def category(case):
     """A recommendation matches only when its developers are exactly the people who handled the ticket."""
@@ -56,8 +70,9 @@ class Analytics:
         rows=d.get('assignments') or ([{'part':d.get('part',''),'agents':[{'agent_name':d['agent_name']}],'works':[]}] if d.get('agent_name') else [])
         return ({r['part'] for r in rows if r.get('part')},{p['agent_name'] for r in rows for p in r.get('agents',[])},rows)
 
-    def import_cases(self,rows):
-        """Compare each completed ticket in the uploaded sheet with its first auto-recommendation."""
+    def import_cases(self,rows,source=''):
+        """Compare each completed ticket in the uploaded sheet with its first auto-recommendation.
+        A ticket stays listed under the file it first appeared in; tickets new to this upload get `source`."""
         c=self.store.config
         devs={a['name'] for a in c['agents'] if a.get('name')};pis={m['name'] for m in members(c['settings'])}
         with self.lock:
@@ -69,7 +84,9 @@ class Analytics:
                 case={'ticket_id':row['ticket_id'],'summary':redact(row.get('summary',''))[:1000],'hospital':row.get('hospital',''),
                     'completed':row.get('completed',False),'status_conflict':row.get('status_conflict',False),
                     'actual_parts':sorted(actual_parts),'actual_devs':sorted(actual_devs),'actual_pis':sorted(actual_pis),
-                    'excluded':(old.get(tid) or {}).get('excluded',False),'imported_at':stamp()}
+                    'excluded':(old.get(tid) or {}).get('excluded',False),'imported_at':stamp(),
+                    'source_file':(old.get(tid) or {}).get('source_file') or source,
+                    'source_at':(old.get(tid) or {}).get('source_at') or stamp()}
                 if not d:case.update(category='no_decision')
                 else:
                     parts,people,assign=self.recommended(d)
@@ -108,24 +125,51 @@ class Analytics:
             'input_tokens':sum(u['input_tokens'] for u in known),'output_tokens':sum(u['output_tokens'] for u in known),
             'cache_read_tokens':sum(u.get('cache_read_input_tokens') or 0 for u in known),
             'cache_write_tokens':sum(u.get('cache_creation_input_tokens') or 0 for u in known),
-            'usage_unknown':len(self.usage)-len(known)}
+            'usage_unknown':len(self.usage)-len(known),'cost':round(sum(cost(u) or 0 for u in self.usage),4)}
+
+    MIN_EVIDENCE=3
 
     def suggestions(self):
-        """Catalogue owner changes seen repeatedly: same part/work, recommended person replaced by one other person."""
+        """Work owner changes backed by past tickets. For each part/work, a person qualifies when
+        - the auto-recommended people were not who handled it, yet this person did, in at least MIN_EVIDENCE tickets, and
+        - that is more tickets than the work's current owner handled."""
         from .catalog import works,part
-        c=self.store.config;count=Counter()
+        c=self.store.config;replaced=Counter();owner_handled=Counter();rows={}
+        def row(p,w):
+            if (p,w) not in rows:rows[(p,w)]=next((x for x in works(c,p) if x['work']==w),None) if w else part(c,p)
+            return rows[(p,w)]
         for x in self.scored():
-            if x['category']!='person_change' or len(x['actual_devs'])!=1:continue
-            actual=x['actual_devs'][0]
             for r in x.get('rec_works',[]):
                 if r['part'] not in x['actual_parts']:continue
-                for w in r['works'] or ['']:count[(r['part'],w,actual)]+=1
+                for w in r['works'] or ['']:
+                    cur=(row(r['part'],w) or {}).get('developer')
+                    if cur in x['actual_devs']:owner_handled[(r['part'],w)]+=1
+                    if x['category']=='person_change':
+                        for actual in x['actual_devs']:
+                            if actual not in r['agents']:replaced[(r['part'],w,actual)]+=1
         out=[]
-        for (p,w,actual),n in count.most_common(30):
-            row=next((x for x in works(c,p) if x['work']==w),None) if w else part(c,p)
-            if not row or row.get('developer')==actual:continue
-            out.append({'part':p,'work':w,'current':row.get('developer',''),'current_backup':row.get('developer_backup',''),'actual':actual,'count':n})
-        return out
+        for (p,w,actual),n in replaced.items():
+            cur=row(p,w)
+            if not cur or cur.get('developer')==actual:continue
+            mine=owner_handled[(p,w)]
+            if n>=self.MIN_EVIDENCE and n>mine:
+                out.append({'part':p,'work':w,'current':cur.get('developer',''),'current_backup':cur.get('developer_backup',''),
+                    'actual':actual,'count':n,'current_count':mine})
+        return sorted(out,key=lambda x:(-x['count'],x['part'],x['work']))
+
+    def daily_usage(self,days=30):
+        """Claude calls, tokens and estimated USD per KST date, newest first. Calls whose tokens or price are unknown are counted apart."""
+        rows={}
+        for u in self.usage:
+            try:d=datetime.fromisoformat(u['at']).astimezone(KST).date().isoformat()
+            except (KeyError,ValueError):continue
+            r=rows.setdefault(d,{'date':d,'requests':0,'input_tokens':0,'output_tokens':0,'cache_read_tokens':0,'cache_write_tokens':0,'cost':0.0,'unpriced':0,'models':{}})
+            r['requests']+=1;usd=cost(u)
+            if usd is None:r['unpriced']+=1;continue
+            r['input_tokens']+=u['input_tokens'];r['output_tokens']+=u['output_tokens']
+            r['cache_read_tokens']+=u.get('cache_read_input_tokens') or 0;r['cache_write_tokens']+=u.get('cache_creation_input_tokens') or 0
+            r['cost']+=usd;r['models'][u['model']]=r['models'].get(u['model'],0)+usd
+        return [{**r,'cost':round(r['cost'],4),'models':{k:round(v,4) for k,v in r['models'].items()}} for r in sorted(rows.values(),key=lambda r:r['date'],reverse=True)[:days]]
 
     def propose(self):
         # Data examples only; the safety system prompt stays intact.
