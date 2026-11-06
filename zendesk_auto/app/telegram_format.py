@@ -10,15 +10,26 @@ def format_notification(result, ticket_id=None, simulation=False):
     urgent_prefix='[긴급] ' if result.get('urgent') else ''
     entries=result.get('recommended_assignments')
     if entries:
-        lines=[]
-        for entry in entries:
+        # Each person appears once, under the part where they weigh most: the PRIMARY role first, then list order.
+        rank={'PRIMARY':0,'COLLABORATOR':1,'UNDETERMINED':2}
+        rows=[]
+        for index,entry in enumerate(entries):
             people=[]
             for agent in entry.get('agents',[]):
                 raw=agent.get('agent_name','')
                 if not allowed_agent({'name':raw}):continue
                 name=_safe(raw,80)
-                if name:people.append(name if name.endswith('책임님') else name+' 책임님')
-            lines.append(f"{_safe(entry.get('part') or '담당파트 확인 필요',80)} {', '.join(people) or '담당자 미정'}")
+                if name and name not in people:people.append(name)
+            rows.append({'part':_safe(entry.get('part') or '담당파트 확인 필요',80),'people':people,'key':(rank.get(entry.get('role'),3),index)})
+        owner={}
+        for row in rows:
+            for name in row['people']:
+                if name not in owner or row['key']<owner[name]['key']:owner[name]=row
+        lines=[]
+        for row in rows:
+            mine=[n for n in row['people'] if owner[n] is row]
+            if row['people'] and not mine:continue
+            lines.append(f"{row['part']} "+(', '.join(n if n.endswith('책임님') else n+' 책임님' for n in mine) or '담당자 미정'))
         heading=urgent_prefix+f"[{hospital}] " + ' / '.join(lines)
     else:
         part=_safe(result.get('part') or '담당파트 확인 필요',80)

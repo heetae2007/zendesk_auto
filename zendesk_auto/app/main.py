@@ -283,7 +283,7 @@ def simulate(body:dict):
     if pis_name and pis_name not in active_names(c['settings']):raise HTTPException(400,'등록되지 않은 PIS 담당자입니다.')
     if pis_name:result.update(pis_name=pis_name,pis_reason='테스트에서 직접 선택')
     # Same rule as live tickets, but the assignment ledger is only read, never written.
-    else:engine.apply_pis(c,0,result,now.date().isoformat(),None,record=False)
+    else:engine.apply_pis(c,0,result,now.date().isoformat(),None,record=False,now=now)
     result['operations_field']=expected_people(result,c)
     result['telegram_status']='not_requested'
     if body.get('send_telegram') is True:

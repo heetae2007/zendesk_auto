@@ -7,7 +7,7 @@ from .catalog import parts,works,resolve,pis_rows
 from .store import stamp,revision
 from .clients import IntegrationError,WriteRejected,model_for,error_detail
 from .telegram_format import format_notification
-from .pis import on_call,pick_realtime,pick_backlog
+from .pis import on_duty,pick_realtime,pick_backlog
 from .zendesk_write import live_enabled,build_update,applied,test_tickets,test_hospitals,test_mode,hospital_tags
 
 class Engine:
@@ -133,10 +133,10 @@ class Engine:
             result['mapping_warning']='담당자의 Zendesk ID/선택값이 미설정입니다.'
         return result
 
-    def pick_pis(self,c,tid,result,day,batch=None,record=True):
+    def pick_pis(self,c,tid,result,day,batch=None,record=True,now=None):
         """Exactly one confirmed on-call PIS, or None. One ledger row per ticket, so no double counting."""
         ledger=self.store.state.setdefault('pis',{});key=str(tid)
-        eligible={m['name'] for m in on_call(c['settings'],day)}
+        people,lunch_note=on_duty(c['settings'],day,now);eligible={m['name'] for m in people}
         prior=ledger.get(key)
         if prior and prior.get('date')==day and prior.get('name') in eligible and (batch is None or prior['name'] not in batch):
             if batch is not None:batch.add(prior['name'])
@@ -145,19 +145,20 @@ class Engine:
             name,reason=pick_backlog(pis_rows(c,result.get('recommended_assignments',[])),eligible,batch)
             if not name:
                 # Every ticket needs a PIS: once primary/backup are used up, continue by weight among today's on-call.
-                name,why=pick_realtime(c['settings'],day,{k:v for k,v in ledger.items() if k!=key})
+                name,why=pick_realtime(c['settings'],day,{k:v for k,v in ledger.items() if k!=key},now)
                 reason=reason+' → 비중 순서 배정' if name else why
             reason='밀린 티켓 묶음: '+reason
             if name:batch.add(name)
         else:
-            name,reason=pick_realtime(c['settings'],day,{k:v for k,v in ledger.items() if k!=key})
+            name,reason=pick_realtime(c['settings'],day,{k:v for k,v in ledger.items() if k!=key},now)
+        if lunch_note and name and lunch_note not in reason:reason=lunch_note+' · '+reason
         if record:
             if name:ledger[key]={'date':day,'name':name,'reason':reason,'at':stamp()}
             else:ledger.pop(key,None)
         return name,reason
 
-    def apply_pis(self,c,tid,result,day,batch=None,record=True):
-        name,reason=self.pick_pis(c,tid,result,day,batch,record)
+    def apply_pis(self,c,tid,result,day,batch=None,record=True,now=None):
+        name,reason=self.pick_pis(c,tid,result,day,batch,record,now)
         result.update(pis_name=name or '',pis_reason=reason)
         if not name:
             result['status']='review';result['review_reasons']=list(result.get('review_reasons',[]))+['PIS 담당자 미배정: '+reason]
@@ -258,7 +259,7 @@ class Engine:
             for j in pending[:10]:
                 tid=j['ticket_id']
                 if j.get('attempts',0)>=3:
-                    failed=self.apply_pis(c,tid,{'status':'review','reason':'AI 분석 재시도 3회 초과'},day,batch)
+                    failed=self.apply_pis(c,tid,{'status':'review','reason':'AI 분석 재시도 3회 초과'},day,batch,now=now)
                     self.store.set_job(tid,**failed);self.notify(c,self.store.state['jobs'][str(tid)]);continue
                 try:
                     current=self.z.ticket(tid)
@@ -271,7 +272,7 @@ class Engine:
                         fresh=self.store.refresh()
                         if revision(fresh)!=revision(c):
                             self.store.set_job(tid,status='queued',reason='설정 변경으로 다음 주기에 재분석');continue
-                        self.apply_pis(c,tid,result,day,batch)
+                        self.apply_pis(c,tid,result,day,batch,now=now)
                         self.store.set_job(tid,**result)
                         if self.analytics:self.analytics.add_decision(self.store.state['jobs'][str(tid)])
                     selected={p['agent_id'] for a in result.get('recommended_assignments',[]) for p in a['agents']} if result['status']=='recommended' else set()

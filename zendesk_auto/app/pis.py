@@ -1,10 +1,17 @@
 """PIS on-call schedule and selection. Pure functions; callers persist the ledger."""
 import re
-from datetime import date, timedelta
+from datetime import date, time, timedelta
+from zoneinfo import ZoneInfo
 from .pis_preview import preview
 
+KST = ZoneInfo('Asia/Seoul')
+
 PIS_NAMES = ('전진야','이우리','강지영','김지수','김현우','조한슬','김현정','한다연','김혜림','이혜경','이다송','노주영','김갑진')
-SLOTS = ('call1','call2','call3')
+SLOTS = ('call1','call2','call3','call4')
+# The second slot is the lunch duty: only this person takes tickets at lunch and is off ticket duty for the hour after.
+LUNCH_SLOT = 'call2'
+LUNCH = (time(12,0), time(13,0))
+LUNCH_BREAK = (time(13,0), time(14,0))
 
 def default_members():
     return [{'name':n,'active':True,'option_value':''} for n in PIS_NAMES]
@@ -28,13 +35,25 @@ def on_call(settings, day):
     shared=all(isinstance(m.get('share'),int) and m['share']>0 for m in people)
     return [{**m,'weight':m['share'] if shared else 1} for m in people]
 
+def on_duty(settings, day, now=None):
+    """(people, note): on-call members who may take a ticket at `now`. Without `now` the lunch rule is not applied.
+    12:00-13:00 only the lunch duty takes tickets; 13:00-14:00 everyone but the lunch duty. A missing or absent lunch duty means no restriction."""
+    people=on_call(settings, day)
+    if now is None:return people,''
+    t=(now.astimezone(KST) if now.tzinfo else now).time()
+    lunch=next((m for m in people if m.get('slot')==LUNCH_SLOT),None)
+    if lunch is None:return people,''
+    if LUNCH[0]<=t<LUNCH[1]:return [lunch],'점심 당직 시간(12~13시)'
+    if LUNCH_BREAK[0]<=t<LUNCH_BREAK[1]:return [m for m in people if m is not lunch],'점심 당직자 식사 시간(13~14시)'
+    return people,''
+
 def check_shares(day):
     """Shares are percentages among the day's non-absent on-call people: all blank (equal split) or summing to 100."""
     shares=[m.get('share') for m in day.get('members',[]) if not m.get('absent')]
     if all(x is None for x in shares):return
     if any(isinstance(x,bool) or not isinstance(x,int) or not 1<=x<=100 for x in shares):
         raise ValueError(f"{day['date']}: 배정 비율은 부재가 아닌 젠콜 담당자 모두에게 1~100 사이 정수로 입력하세요.")
-    if sum(shares)!=100:raise ValueError(f"{day['date']}: 배정 비율 합계가 {sum(shares)}%입니다. 100%가 되도록 입력하세요.")
+    if abs(sum(shares)-100)>1:raise ValueError(f"{day['date']}: 배정 비율 합계가 {sum(shares)}%입니다. 100%(±1%)가 되도록 입력하세요.")
 
 def validate_settings(s, today=None):
     seen=set()
@@ -52,6 +71,7 @@ def validate_settings(s, today=None):
             if m['name'] in names:raise ValueError('같은 날짜에 같은 PIS 담당자가 중복됩니다.')
             names.add(m['name'])
             if m.get('slot') not in SLOTS+('',None):raise ValueError('젠콜 순번 오류')
+        if not isinstance(d.get('note',''),str) or len(d.get('note',''))>300:raise ValueError(f"{d['date']}: 비고는 300자 이하 문자로 입력하세요.")
         check_shares(d)
     t=s.get('pis_backlog_threshold',0)
     if isinstance(t,bool) or not isinstance(t,int) or not 0<=t<=10:raise ValueError('밀린 티켓 기준 건수는 0~10입니다.')
@@ -66,13 +86,14 @@ def counts(ledger, day):
         if entry.get('date')==day and entry.get('name'):result[entry['name']]=result.get(entry['name'],0)+1
     return result
 
-def pick_realtime(settings, day, ledger):
+def pick_realtime(settings, day, ledger, now=None):
     """Weighted deficit against today's recorded assignments; one ticket at a time."""
-    people=on_call(settings, day)
-    if not people:return None,'당일 확정된 젠콜 담당자가 없거나 모두 부재입니다.'
+    people,note=on_duty(settings, day, now)
+    if not people:
+        return None,(note+'이며 배정 가능한 다른 젠콜 담당자가 없습니다.') if note else '당일 확정된 젠콜 담당자가 없거나 모두 부재입니다.'
     done=counts(ledger, day)
     rows=[{'name':m['name'],'weight':m['weight'],'assigned':done.get(m['name'],0)} for m in people]
-    return preview(rows,1)['sequence'][0],'실시간 비중 배정'
+    return preview(rows,1)['sequence'][0],(note+' · ' if note else '')+'실시간 비중 배정'
 
 def split_names(value):
     # Only exact names, or slash-separated exact names, are considered; annotations stay unmatched.

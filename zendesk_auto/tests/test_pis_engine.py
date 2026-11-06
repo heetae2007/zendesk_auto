@@ -43,7 +43,7 @@ def test_blank_shares_split_equally(system):
     for tid in range(1,5):e.pick_pis(s.config,tid,{},DAY)
     assert sorted(v['name'] for v in s.state['pis'].values())==['A','A','B','B']
 
-@pytest.mark.parametrize('shares,ok',[((None,None,None),True),((40,30,30),True),((40,30,None),False),((40,30,20),False),((0,50,50),False),((50.5,25,24.5),False)])
+@pytest.mark.parametrize('shares,ok',[((None,None,None),True),((40,30,30),True),((40,30,29),True),((40,30,31),True),((40,30,28),False),((40,30,None),False),((40,30,20),False),((0,50,50),False),((50.5,25,24.5),False)])
 def test_day_shares_must_total_100(shares,ok):
     c=config();names=('A','B','C')
     c['settings']['pis_members']=[{'name':n,'active':True,'option_value':''} for n in names+('D',)]
@@ -186,3 +186,60 @@ def test_claude_payload_is_lean_cached_and_per_purpose(monkeypatch):
     try:ai.read_schedule(b'x','image/png',['A'])
     except IntegrationError:pass
     assert sent[1]['model']=='claude-sonnet-4-6' and 'effort' not in sent[1]['output_config']
+
+
+def lunch_roster(c,lunch_absent=False,only_lunch=False):
+    names=['A','B','C','D'];c['settings']['pis_members']=[{'name':n,'active':True,'option_value':''} for n in names]
+    people=[('A','call1'),('B','call2'),('C','call3'),('D','call4')]
+    if only_lunch:people=[('B','call2')]
+    c['settings']['pis_days']=[{'date':DAY,'members':[{'name':n,'slot':k,'absent':n=='B' and lunch_absent,'share':None} for n,k in people]}]
+
+def at(h,m):
+    from datetime import datetime
+    from app.domain import KST
+    return datetime(2026,11,2,h,m,tzinfo=KST)
+
+def test_lunch_duty_takes_only_lunch_hour_tickets(system):
+    s,z,a,t,e=system;lunch_roster(s.config)
+    picked={e.pick_pis(s.config,i,{},DAY,now=at(12,0)+__import__('datetime').timedelta(minutes=i))[0] for i in range(1,30)}
+    assert picked=={'B'}
+    assert 'B' not in {e.pick_pis(s.config,100+i,{},DAY,now=at(13,0)+__import__('datetime').timedelta(minutes=i))[0] for i in range(0,59)}
+    s.state['pis'].clear()  # after 14:00 the usual weighted rule applies, so the lunch duty is back in the rotation
+    assert 'B' in {e.pick_pis(s.config,200+i,{},DAY,now=at(14,0))[0] for i in range(12)}
+    assert e.pick_pis(s.config,300,{},DAY,now=at(11,59),record=False)[0] in {'A','B','C','D'}
+
+def test_lunch_boundaries_and_reason(system):
+    s,z,a,t,e=system;lunch_roster(s.config)
+    assert e.pick_pis(s.config,1,{},DAY,now=at(12,0),record=False)==('B','점심 당직 시간(12~13시) · 실시간 비중 배정')
+    assert e.pick_pis(s.config,2,{},DAY,now=at(12,59),record=False)[0]=='B'
+    assert e.pick_pis(s.config,3,{},DAY,now=at(13,0),record=False)[0]!='B'
+    assert e.pick_pis(s.config,4,{},DAY,now=at(13,59),record=False)[0]!='B'
+    assert e.pick_pis(s.config,5,{},DAY,record=False)[0] is not None  # no clock given: rule not applied
+
+def test_lunch_rule_skips_absent_or_missing_lunch_duty(system):
+    s,z,a,t,e=system;lunch_roster(s.config,lunch_absent=True)
+    assert {e.pick_pis(s.config,i,{},DAY,now=at(12,30),record=False)[0] for i in range(1,5)}<= {'A','C','D'}
+    s.config['settings']['pis_days'][0]['members']=[m for m in s.config['settings']['pis_days'][0]['members'] if m['slot']!='call2']
+    assert e.pick_pis(s.config,9,{},DAY,now=at(13,30),record=False)[0] in {'A','C','D'}
+
+def test_lunch_break_with_no_other_duty_is_unassigned(system):
+    s,z,a,t,e=system;lunch_roster(s.config,only_lunch=True)
+    name,why=e.pick_pis(s.config,1,{},DAY,now=at(13,30),record=False)
+    assert name is None and '점심' in why
+    assert e.pick_pis(s.config,2,{},DAY,now=at(12,30),record=False)[0]=='B'
+    assert e.pick_pis(s.config,3,{},DAY,now=at(14,0),record=False)[0]=='B'
+
+def test_lunch_rule_applies_to_backlog_batches(system):
+    s,z,a,t,e=system;lunch_roster(s.config);s.config['settings'].update(work_mappings=MAPS)
+    s.config['settings']['work_mappings'][0].update(pis='B',pis_backup='A')
+    r={'recommended_assignments':[{'part':'보험','works':['심사']}]}
+    assert e.pick_pis(s.config,1,r,DAY,set(),record=False,now=at(13,30))[0]=='A'
+    assert e.pick_pis(s.config,2,r,DAY,set(),record=False,now=at(12,30))[0]=='B'
+
+def test_four_slots_and_note_validate(system):
+    s,z,a,t,e=system;lunch_roster(s.config);d=s.config['settings']['pis_days'][0];d['note']='연차 : A'
+    validate_config(s.config)
+    d['note']='x'*301
+    with pytest.raises(ValueError):validate_config(s.config)
+    d['note']='';d['members'][0]['slot']='call5'
+    with pytest.raises(ValueError):validate_config(s.config)
