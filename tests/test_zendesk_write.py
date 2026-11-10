@@ -166,7 +166,9 @@ def test_review_written_when_switch_on_but_never_urgent():
     # No developer found: registered with the PIS only.
     p=build_update(job(status='review',recommended_assignments=[{**ai_out()['recommended_assignments'][0],'agents':[]}]),c,TICKET)['ticket']
     assert {'id':DEV_FIELD,'value':['pis_lee']} in p['custom_fields']
-    with pytest.raises(ValueError,match='긴급'):build_update(job(status='review',urgent=True),c,TICKET)
+    # Urgent tickets, by keyword or by Claude, are registered with the intake notice as well.
+    assert build_update(job(status='review',urgent=True,urgent_keyword='랜섬웨어'),c,TICKET)['ticket']['comment']['public']
+    assert build_update(job(status='review',urgent=True,urgent_reason='급한 요청'),c,TICKET)['ticket']['custom_status_id']==222
     with pytest.raises(ValueError,match='개발 담당자'):build_update(job(recommended_assignments=[{**ai_out()['recommended_assignments'][0],'agents':[]}]),live_config(),TICKET)
 
 def test_tick_writes_review_only_with_switch(live):

@@ -119,7 +119,7 @@ def build_update(job, c, ticket, default_form_id=None, allow_review=False):
     # Review results are written when the operator turned on '검토 필요도 접수' or pressed '테스트 접수'. Every other check still applies.
     review=job.get('status')=='review' and (allow_review or c['settings'].get('live_include_review') is True)
     if job.get('status')!='recommended' and not review:raise ValueError('검토가 필요한 추천은 자동 접수하지 않습니다.')
-    if job.get('urgent'):raise ValueError('긴급 의심 티켓은 자동 접수하지 않습니다.')
+    # Urgent tickets (keyword rule or Claude) are registered too; urgency only adds [긴급] to Telegram and a review reason.
     if ticket.get('status')!='new':raise ValueError('현재 신규 상태가 아닙니다.')
     if ticket.get('updated_at')!=job.get('source_updated_at'):raise ValueError('최초 감지 이후 변경된 티켓입니다.')
     form=ticket.get('ticket_form_id')

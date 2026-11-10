@@ -155,7 +155,10 @@ def test_ai_disabled_requires_review(system):
 
 def test_urgent(system):
     s,z,a,t,e=system;z.t['subject']='전체 사용자 로그인 불가';e.tick(NOW)
-    assert s.state['jobs']['1']['urgent'] and s.state['jobs']['1']['status']=='review'
+    j=s.state['jobs']['1']
+    # Still analysed (parts, people) so it can be registered; marked urgent and left for review.
+    assert j['urgent'] and j['urgent_keyword'] and j['status']=='review' and j['recommended_assignments']
+    assert any('긴급 의심' in r for r in j['review_reasons'])
 
 def test_api_failure(system):
     s,z,a,t,e=system;z.fail=True;assert e.tick(NOW).get('error')

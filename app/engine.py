@@ -67,10 +67,11 @@ class Engine:
         tag=next((x['value'] for x in t.get('custom_fields',[]) if str(x['id'])==str(field)),None)
         result={'hospital':hospital,'hospital_tag':tag if isinstance(tag,str) else None,'summary':text[:2000],'part':'','agent_id':None,'agent_name':'',
             'confidence':None,'reason':'','similar_tickets':examples,'search_mode':'문자 유사도 검색',
-            'urgent':bool(urgent),'related_ticket_ids':[],'config_revision':revision(c),'mode':'recommendation_only','prompt_version':prompt_version}
-        if urgent:result.update(status='review',reason='긴급 의심: '+urgent);return result
+            'urgent':bool(urgent),'urgent_keyword':urgent,'related_ticket_ids':[],'config_revision':revision(c),'mode':'recommendation_only','prompt_version':prompt_version}
+        # A keyword hit (개인정보 유출, 랜섬웨어 …) no longer stops the analysis: the ticket still gets parts, people and
+        # the intake notice, and is marked [긴급] with a review reason so a person looks at it at once.
         if not c['settings'].get('ai_enabled',False):
-            result.update(status='review',reason='AI 분석이 비활성화되어 있습니다. 설정을 확인하세요.');return result
+            result.update(status='review',reason=('긴급 의심: '+urgent+' / ' if urgent else '')+'AI 분석이 비활성화되어 있습니다. 설정을 확인하세요.');return result
         examples,search_mode=self.ai.search(text,self.store.history,hospital)
         department_field=c['settings'].get('mapping',{}).get('department_field_id')
         department=next((f.get('value') for f in t.get('custom_fields',[]) if department_field and str(f.get('id'))==str(department_field)),'')
@@ -106,6 +107,7 @@ class Engine:
         if not hospital:reasons.append('병원 필드 매핑이 필요합니다.')
         if any(not a['agents'] for a in assignments):reasons.append('담당자가 확인되지 않은 파트가 있습니다.')
         if any(a['role']=='UNDETERMINED' for a in assignments):reasons.append('주담당과 협업 담당 구분이 필요합니다.')
+        if urgent:reasons.append('긴급 의심: '+urgent)
         if out['urgent']:reasons.append(out['urgent_reason'] or '긴급 문의 검토가 필요합니다.')
         if out['confidence']<c['settings']['min_confidence']:reasons.append('추천 신뢰도가 기준보다 낮습니다.')
         if out['requires_manual_review']:reasons.append('AI가 검토를 요청했습니다.')
@@ -118,7 +120,7 @@ class Engine:
             agent_id=all_people[0]['agent_id'] if single else None,
             agent_name=all_people[0]['agent_name'] if single else '',
             summary=out['summary'],confidence=out['confidence'],reason=out['reason'],
-            urgent=out['urgent'],urgent_reason=out['urgent_reason'],review_reasons=reasons,
+            urgent=out['urgent'] or bool(urgent),urgent_reason=out['urgent_reason'],review_reasons=reasons,
             similar_tickets=examples,search_mode=search_mode,
             status='review' if reasons else 'recommended')
         if reasons:result['reason']=' / '.join(reasons)+' / '+out['reason']
