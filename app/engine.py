@@ -1,5 +1,5 @@
 """Worker: durable queue, bounded passes. Ticket mutations only via the gated intake in write()."""
-import threading, copy, time
+import threading, copy, time, logging
 from datetime import datetime,timedelta
 from .domain import (KST,operating,redact,lexical_search,is_pre_review_screen,apply_pre_review_rule,PRE_REVIEW_PARTS,
     urgent_candidate,similarity,hospital_name,allowed_agent)
@@ -231,9 +231,11 @@ class Engine:
         try:
             message_id=self.telegram.send(text)
             self.store.state['notifications'][key]={'status':'sent','message_id':message_id,'at':stamp()}
-        except Exception:
-            # Unknown send result: operator may explicitly reset after checking chat.
-            self.store.state['notifications'][key]={'status':'unknown','at':stamp()}
+        except Exception as e:
+            # Unknown send result: operator may explicitly reset after checking chat. The error is kept for diagnosis.
+            detail=error_detail(e)
+            logging.getLogger('uvicorn.error').error('Telegram 전송 실패 ticket=%s: %s',j['ticket_id'],detail)
+            self.store.state['notifications'][key]={'status':'unknown','at':stamp(),'error':detail}
         self.store.save_state()
 
     def tick(self,now=None):

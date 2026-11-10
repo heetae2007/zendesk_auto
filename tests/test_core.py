@@ -183,6 +183,13 @@ def test_telegram_failure_does_not_reprocess(system):
     assert s.state['jobs']['1']['status']=='recommended';assert t.n==1
     assert s.state['notifications']['1:recommendation']['status']=='unknown'
 
+def test_telegram_failure_is_logged_with_reason(system,caplog):
+    s,z,a,t,e=system;s.config['settings']['notify']=True;t.fail=True
+    with caplog.at_level('ERROR',logger='uvicorn.error'):e.tick(NOW)
+    n=s.state['notifications']['1:recommendation']
+    assert n['status']=='unknown' and n['error']
+    assert 'Telegram 전송 실패 ticket=1' in caplog.text and n['error'] in caplog.text
+
 def test_concurrent_run(system):
     s,z,a,t,e=system;e.run_lock.acquire()
     try:assert e.tick(NOW)=={'skipped':'already_running'}

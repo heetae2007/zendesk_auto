@@ -294,10 +294,13 @@ class Telegram:
         if not token or not chat:raise IntegrationError('Telegram 미설정')
         try:
             r=httpx.post(f'https://api.telegram.org/bot{token}/sendMessage',json={'chat_id':chat,'text':text,'parse_mode':'HTML','disable_web_page_preview':True},timeout=20)
-        except httpx.RequestError:
-            # Do not expose request URL (contains token).
-            raise IntegrationError('Telegram 응답 확인 불가') from None
-        if r.status_code>=400:raise IntegrationError(f'Telegram HTTP {r.status_code}')
-        data=r.json()
-        if not data.get('ok'):raise IntegrationError('Telegram 전송 거부')
-        return data['result']['message_id']
+        except httpx.RequestError as e:
+            # Do not expose request URL (contains token): only the exception class (e.g. ConnectTimeout, ConnectError).
+            raise IntegrationError('Telegram 응답 확인 불가 ('+type(e).__name__+')') from None
+        # Telegram's own explanation (e.g. "Too Many Requests: retry after 5") never contains the token.
+        try:body=r.json()
+        except ValueError:body={}
+        why=str(body.get('description') or '')[:200] if isinstance(body,dict) else ''
+        if r.status_code>=400:raise IntegrationError(f'Telegram HTTP {r.status_code}'+(f': {why}' if why else ''))
+        if not body.get('ok'):raise IntegrationError('Telegram 전송 거부'+(f': {why}' if why else ''))
+        return body['result']['message_id']
