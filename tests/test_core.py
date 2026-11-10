@@ -190,6 +190,31 @@ def test_telegram_failure_is_logged_with_reason(system,caplog):
     assert n['status']=='unknown' and n['error']
     assert 'Telegram 전송 실패 ticket=1' in caplog.text and n['error'] in caplog.text
 
+def test_resend_only_failed_notifications(system):
+    s,z,a,t,e=system;s.config['settings']['notify']=True;t.fail=True;e.tick(NOW)
+    key='1:recommendation';job_before=dict(s.state['jobs']['1']);writes_before=dict(s.state.get('writes',{}))
+    assert s.state['notifications'][key]['status']=='unknown'
+    t.fail=False;calls=t.n;analyses=len(a.calls)
+    r=e.resend_notifications()
+    assert r=={'sent':[1],'failed':[],'skipped':[]} and t.n==calls+1
+    n=s.state['notifications'][key];assert n['status']=='sent' and n['message_id']==100 and n['resent']
+    # Nothing but the Telegram message: no new analysis, job and Zendesk write records unchanged.
+    assert len(a.calls)==analyses and s.state['jobs']['1']==job_before and s.state.get('writes',{})==writes_before
+    # Already sent: never sent again.
+    assert e.resend_notifications(1)=={'sent':[],'failed':[],'skipped':[1]} and t.n==calls+1
+
+def test_resend_failure_keeps_unknown_with_reason(system):
+    s,z,a,t,e=system;s.config['settings']['notify']=True;t.fail=True;e.tick(NOW)
+    r=e.resend_notifications(1)
+    assert r['sent']==[] and r['failed'][0]['ticket_id']==1 and r['failed'][0]['error']
+    n=s.state['notifications']['1:recommendation'];assert n['status']=='unknown' and n['error']==r['failed'][0]['error']
+
+def test_resend_refuses_while_running(system):
+    s,z,a,t,e=system;e.run_lock.acquire()
+    try:
+        with pytest.raises(RuntimeError):e.resend_notifications()
+    finally:e.run_lock.release()
+
 def test_concurrent_run(system):
     s,z,a,t,e=system;e.run_lock.acquire()
     try:assert e.tick(NOW)=={'skipped':'already_running'}

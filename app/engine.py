@@ -238,6 +238,28 @@ class Engine:
             self.store.state['notifications'][key]={'status':'unknown','at':stamp(),'error':detail}
         self.store.save_state()
 
+    def resend_notifications(self,tid=None):
+        """Send again only the Telegram messages whose result is 'unknown' (failed or unconfirmed). Nothing else is touched:
+        no analysis, PIS assignment or Zendesk write. One ticket, or all of them; stops at the first failure."""
+        if not self.run_lock.acquire(blocking=False):raise RuntimeError('분석 중입니다. 완료 후 다시 시도하세요.')
+        try:
+            notes=self.store.state['notifications'];jobs=self.store.state['jobs']
+            keys=[f'{int(tid)}:recommendation'] if tid is not None else [k for k,v in notes.items() if v.get('status')=='unknown']
+            sent=[];failed=[];skipped=[]
+            for key in keys:
+                t=key.split(':')[0];n=notes.get(key);j=jobs.get(t)
+                if not j or not n or n.get('status')!='unknown':skipped.append(int(t));continue
+                try:
+                    message_id=self.telegram.send(format_notification(j,ticket_id=j['ticket_id']))
+                except Exception as e:
+                    detail=error_detail(e)
+                    logging.getLogger('uvicorn.error').error('Telegram 재전송 실패 ticket=%s: %s',t,detail)
+                    n.update(at=stamp(),error=detail);self.store.save_state();failed.append({'ticket_id':int(t),'error':detail});break
+                notes[key]={'status':'sent','message_id':message_id,'at':stamp(),'resent':True};self.store.save_state();sent.append(int(t))
+            return {'sent':sent,'failed':failed,'skipped':skipped}
+        finally:
+            self.run_lock.release()
+
     def tick(self,now=None):
         if not self.run_lock.acquire(blocking=False):return {'skipped':'already_running'}
         try:

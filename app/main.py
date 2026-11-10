@@ -265,6 +265,15 @@ def retry(tid:int):
     except Exception:raise HTTPException(503,'티켓 재조회 실패')
     store.set_job(tid,status='queued',attempts=0,source_updated_at=t['updated_at']);return {'ok':True}
 
+@app.post('/api/notifications/resend',dependencies=[Depends(auth)])
+def resend_notifications(body:dict=None):
+    """Telegram only: resend the notifications recorded as failed/unconfirmed ('unknown'). Body {ticket_id} for one, empty for all."""
+    tid=(body or {}).get('ticket_id')
+    if tid is not None and f'{int(tid)}:recommendation' not in store.state['notifications']:raise HTTPException(404,'알림 기록 없음')
+    if not (os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID')):raise HTTPException(409,'Telegram이 설정되지 않았습니다.')
+    try:return engine.resend_notifications(tid)
+    except RuntimeError as e:raise HTTPException(409,str(e))
+
 @app.post('/api/simulate',dependencies=[Depends(auth)])
 def simulate(body:dict):
     text=redact(body.get('text',''))
