@@ -140,10 +140,11 @@ def test_holiday_backlog(system):
     s,z,a,t,e=system;e.tick(NOW.replace(day=1));assert s.state['jobs']['1']['status']=='deferred'
     e.tick(NOW);assert s.state['jobs']['1']['status']=='recommended'
 
-def test_manual_change(system):
+def test_edited_new_ticket_is_still_registered(system):
+    # A ticket edited after detection but still 'new' is analysed and registered.
     s,z,a,t,e=system;z.change=True;e.tick(NOW)
-    assert s.state['jobs']['1']['status']=='review'
-    assert '변경' in s.state['jobs']['1']['reason']
+    assert s.state['jobs']['1']['status']=='recommended'
+    assert '변경' not in (s.state['jobs']['1'].get('reason') or '')
 
 def test_non_new_skipped(system):
     s,z,a,t,e=system;e.scan(s.config);z.t['status']='open';e.tick(NOW)

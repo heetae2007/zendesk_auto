@@ -33,13 +33,9 @@ def test_payload_has_one_pis_n_devs_safe_update_and_comment():
     assert p['comment']['public'] is True and '#1이 접수' in p['comment']['body']
 
 @pytest.mark.parametrize('change,expect',[
-    (lambda j,c,t:j.update(pis_name=''),'PIS'),
-    (lambda j,c,t:c['agents'][0].update(option_value=''),'선택값 미설정'),
-    (lambda j,c,t:c['settings']['parts'][0].update(option_value=''),'관련파트'),
     (lambda j,c,t:t.update(status='open'),'신규'),
-    (lambda j,c,t:t.update(updated_at='later'),'변경'),
-    (lambda j,c,t:t.update(custom_fields=[{'id':DEV_FIELD,'value':['someone']}]),'덮어쓰지'),
     (lambda j,c,t:j.update(status='review'),'검토'),
+    (lambda j,c,t:c['settings'].update(message=''),'안내 문구'),
     (lambda j,c,t:c['settings']['mapping'].update(custom_status_id=''),'상태'),
 ])
 def test_payload_refuses_unconfirmed_values(change,expect):
@@ -101,24 +97,52 @@ def test_conflict_is_definite_failure(live):
     s,z,e=live(WriteRejected('409'));e.tick(NOW)
     assert s.state['writes']['1']['status']=='failed' and s.state['jobs']['1']['write_status']=='failed'
 
-def test_human_value_blocks_write(live):
+@pytest.mark.parametrize('change,note,kept',[
+    (lambda j,c,t:j.update(pis_name=''),'PIS 미배정',['dev_kim']),
+    (lambda j,c,t:c['agents'][0].update(option_value=''),'선택값 미설정: 김종오',['pis_lee']),
+    (lambda j,c,t:j.update(recommended_assignments=[]),'개발 담당자 없음',['pis_lee']),
+])
+def test_missing_values_are_left_out_not_blocking(change,note,kept):
+    j,c,t=job(),live_config(),copy.deepcopy(TICKET);change(j,c,t)
+    p=build_update(j,c,t)
+    assert any(note in n for n in p['notes'])
+    assert {'id':DEV_FIELD,'value':kept} in p['ticket']['custom_fields'] and p['ticket']['custom_status_id']==222
+
+def test_missing_part_option_is_left_out():
+    c=live_config();c['settings']['parts'][0]['option_value']=''
+    p=build_update(job(),c,TICKET)
+    assert all(f['id']!=PART_FIELD for f in p['ticket']['custom_fields']) and any('관련파트' in n for n in p['notes'])
+
+def test_human_value_is_kept_and_ticket_still_registered(live):
     s,z,e=live();z.t['custom_fields'].append({'id':DEV_FIELD,'value':['manual']});e.tick(NOW)
-    assert not z.updates and s.state['jobs']['1']['write_status']=='blocked'
+    assert len(z.updates)==1 and s.state['jobs']['1']['write_status']=='done'
+    sent=z.updates[0]['ticket']
+    assert all(f['id']!=DEV_FIELD for f in sent['custom_fields']) and sent['custom_status_id']==222 and 'notes' not in z.updates[0]
+    assert s.state['jobs']['1']['status']=='review' and '이미 값이 있어 유지' in s.state['jobs']['1']['reason']
 
 def test_applied_readback():
     p=build_update(job(),live_config(),TICKET)
     assert applied(TICKET,p) is False
     assert applied({**TICKET,'status':'open','updated_at':'y'},p) is None
 
-def test_other_form_is_left_alone():
-    t={**TICKET,'ticket_form_id':999}
-    with pytest.raises(ValueError,match='다른 양식'):build_update(job(),live_config(),t)
-    assert build_update(job(),live_config(),t,default_form_id=999)  # account default form = not chosen by anyone
-    assert build_update(job(),live_config(),{**TICKET,'ticket_form_id':111})
+def test_other_form_is_kept():
+    p=build_update(job(),live_config(),{**TICKET,'ticket_form_id':999})
+    assert 'ticket_form_id' not in p['ticket'] and any('다른 양식' in n for n in p['notes'])
+    assert build_update(job(),live_config(),{**TICKET,'ticket_form_id':999},default_form_id=999)['ticket']['ticket_form_id']==111  # account default = not chosen
+    assert build_update(job(),live_config(),{**TICKET,'ticket_form_id':111})['ticket']['ticket_form_id']==111
 
-def test_engine_blocks_other_form(live):
+def test_engine_registers_other_form_without_changing_it(live):
     s,z,e=live();z.t['ticket_form_id']=555;z.forms=lambda:[{'id':1,'default':True}];e.tick(NOW)
-    assert not z.updates and '다른 양식' in s.state['jobs']['1']['reason']
+    assert len(z.updates)==1 and 'ticket_form_id' not in z.updates[0]['ticket'] and '다른 양식' in s.state['jobs']['1']['reason']
+
+def test_analysis_failure_still_registers(live):
+    s,z,e=live();s.config['settings']['live_include_review']=True
+    def boom(*a,**k):raise RuntimeError('설정에 없는 세부업무')
+    e.ai.classify=boom
+    for _ in range(4):e.tick(NOW)
+    j=s.state['jobs']['1'];sent=z.updates[0]['ticket']
+    assert len(z.updates)==1 and j['write_status']=='done' and j['status']=='review'
+    assert sent['custom_status_id']==222 and sent['comment']['public'] and '3회 초과' in j['reason']
 
 def test_listed_test_tickets_are_the_only_live_targets(live):
     s,z,e=live();s.config['settings']['live_test_tickets']=[999];e.tick(NOW)
@@ -169,7 +193,7 @@ def test_review_written_when_switch_on_but_never_urgent():
     # Urgent tickets, by keyword or by Claude, are registered with the intake notice as well.
     assert build_update(job(status='review',urgent=True,urgent_keyword='랜섬웨어'),c,TICKET)['ticket']['comment']['public']
     assert build_update(job(status='review',urgent=True,urgent_reason='급한 요청'),c,TICKET)['ticket']['custom_status_id']==222
-    with pytest.raises(ValueError,match='개발 담당자'):build_update(job(recommended_assignments=[{**ai_out()['recommended_assignments'][0],'agents':[]}]),live_config(),TICKET)
+    assert '개발 담당자 없음' in build_update(job(recommended_assignments=[{**ai_out()['recommended_assignments'][0],'agents':[]}]),live_config(),TICKET)['notes']
 
 def test_tick_writes_review_only_with_switch(live):
     s,z,e=live();s.config['settings']['min_confidence']=1.0;e.tick(NOW)

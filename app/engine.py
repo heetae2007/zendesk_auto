@@ -178,11 +178,18 @@ class Engine:
         except ValueError as e:
             self.store.set_job(tid,status='review',write_status='blocked',reason='자동 접수 보류: '+str(e));return
         except Exception:
-            self.store.set_job(tid,status='review',write_status='blocked',reason='자동 접수 보류: 접수 직전 티켓 재조회 실패');return
+            # Nothing was written: the ticket goes back to the queue and is tried again next cycle.
+            self.store.set_job(tid,status='retry',attempts=j.get('attempts',0)+1,reason='접수 직전 티켓 재조회 실패, 다음 주기에 재시도');return
+        notes=payload.pop('notes',[])
         writes[key]={'status':'pending','at':stamp(),'payload':payload};self.store.save_state()
         try:
             self.z.update_ticket(tid,payload)
-            writes[key].update(status='done',done_at=stamp());self.store.set_job(tid,write_status='done')
+            writes[key].update(status='done',done_at=stamp())
+            if notes:
+                # Registered, but some values were left for a person to fill in.
+                self.store.set_job(tid,write_status='done',status='review',write_notes=notes,
+                    reason='접수 완료 (일부 미입력: '+' / '.join(notes)+') / '+str(j.get('reason') or ''))
+            else:self.store.set_job(tid,write_status='done')
         except WriteRejected as e:
             writes[key].update(status='failed',error=str(e))
             self.store.set_job(tid,status='review',write_status='failed',reason='자동 접수 실패(변경 없음): '+str(e))
@@ -285,13 +292,20 @@ class Engine:
             for j in pending[:10]:
                 tid=j['ticket_id']
                 if j.get('attempts',0)>=3:
-                    failed=self.apply_pis(c,tid,{'status':'review','reason':'AI 분석 재시도 3회 초과'},day,batch,now=now)
-                    self.store.set_job(tid,**failed);self.notify(c,self.store.state['jobs'][str(tid)]);continue
+                    last=str(j.get('reason') or '')
+                    failed=self.apply_pis(c,tid,{'status':'review','reason':'AI 분석 재시도 3회 초과'+(' (마지막 오류: '+last+')' if last and not last.startswith('AI 분석 재시도') else '')},day,batch,now=now)
+                    self.store.set_job(tid,**failed)
+                    # Still new: registered with status, notice and PIS; parts and developers are left to a person.
+                    if c['settings'].get('live_include_review') is True and self.live_target(c,self.store.state['jobs'][str(tid)]):
+                        try:
+                            if self.z.ticket(tid)['status']=='new':self.write(c,tid)
+                        except Exception:pass
+                    self.notify(c,self.store.state['jobs'][str(tid)]);continue
                 try:
                     current=self.z.ticket(tid)
                     if current['status']!='new':self.store.set_job(tid,status='skipped',reason='현재 신규 상태가 아닙니다.');continue
-                    if current['updated_at']!=j['source_updated_at']:
-                        self.store.set_job(tid,status='review',reason='최초 감지 이후 변경된 티켓입니다.');continue
+                    # Edits made while the ticket is still 'new' (tags, form, comments) do not block intake;
+                    # the analysis uses the current content and build_update still refuses filled fields or another form.
                     result=self.analyze(current,c,loads,unresolved,now)
                     # Settings may change while the AI call is in progress.
                     with self.store.lock:

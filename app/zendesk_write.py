@@ -111,46 +111,54 @@ def current_value(ticket, field_id):
     return next((f.get('value') for f in ticket.get('custom_fields',[]) if str(f.get('id'))==str(field_id)),None)
 
 def build_update(job, c, ticket, default_form_id=None, allow_review=False):
-    """Raise ValueError (→ human review) unless every value is confirmed.
-    A form other than the target or the account default means someone chose it: leave the ticket alone."""
-    m=c['settings'].get('mapping',{});tid=int(ticket['id'])
+    """Every ticket still 'new' is registered: status 등록 + public intake notice.
+    Values a person already set are never overwritten and values we cannot confirm are left out;
+    each omission is returned in payload['notes'] (popped by the caller, never sent to Zendesk).
+    Raises ValueError only when the ticket is no longer new or the server is not configured."""
+    m=c['settings'].get('mapping',{});tid=int(ticket['id']);notes=[]
     for key in ('form_id','custom_status_id','part_field_id','developer_field_id'):
         if not str(m.get(key) or '').strip().isdigit():raise ValueError('Zendesk 양식·상태·필드 ID 설정이 필요합니다.')
-    # Review results are written when the operator turned on '검토 필요도 접수' or pressed '테스트 접수'. Every other check still applies.
+    # Review results are written when the operator turned on '검토 필요도 접수' or pressed '테스트 접수'.
     review=job.get('status')=='review' and (allow_review or c['settings'].get('live_include_review') is True)
     if job.get('status')!='recommended' and not review:raise ValueError('검토가 필요한 추천은 자동 접수하지 않습니다.')
-    # Urgent tickets (keyword rule or Claude) are registered too; urgency only adds [긴급] to Telegram and a review reason.
     if ticket.get('status')!='new':raise ValueError('현재 신규 상태가 아닙니다.')
-    if ticket.get('updated_at')!=job.get('source_updated_at'):raise ValueError('최초 감지 이후 변경된 티켓입니다.')
-    form=ticket.get('ticket_form_id')
-    if form not in (None,'') and str(form) not in (str(m['form_id']),str(default_form_id)):raise ValueError('다른 양식이 지정된 티켓은 변경하지 않습니다.')
-    for key,label in (('part_field_id','관련파트'),('developer_field_id','운영팀 담당자')):
-        if current_value(ticket,m[key]) not in (None,'',[]):raise ValueError(f'{label} 필드에 이미 값이 있어 덮어쓰지 않습니다.')
-    people=expected_people(job,c)
-    pis=[p for p in people if p['role']=='PIS'];devs=[p for p in people if p['role']=='개발']
-    if len(pis)!=1:raise ValueError('PIS 담당자가 정확히 1명이 아닙니다.')
-    # A review result may lack a developer: it is registered with the PIS alone and a person adds the developer.
-    if not devs and not review:raise ValueError('개발 담당자가 없습니다.')
-    missing=[p['name'] for p in people if not p['value']]
-    if missing:raise ValueError('운영팀 담당자 선택값 미설정: '+', '.join(missing))
-    values=[p['value'] for p in people]
-    if len(set(values))!=len(values):raise ValueError('운영팀 담당자 선택값이 중복됩니다.')
-    parts=[a['part'] for a in job.get('recommended_assignments',[])]
-    options={p['name']:p.get('option_value') for p in c['settings'].get('parts',[])}
-    part_values=[options.get(p) for p in parts]
-    if not parts or not all(part_values):raise ValueError('관련파트 선택값 미설정: '+', '.join(p for p,v in zip(parts,part_values) if not v))
     body=str(c['settings'].get('message') or '').replace('[티켓번호]',str(tid)).strip()
     if not body:raise ValueError('접수 안내 문구가 비어 있습니다.')
-    return {'ticket':{'ticket_form_id':int(m['form_id']),'custom_status_id':int(m['custom_status_id']),
-        'custom_fields':[{'id':int(m['part_field_id']),'value':list(dict.fromkeys(part_values))},
-                         {'id':int(m['developer_field_id']),'value':values}],
-        'comment':{'body':body,'public':True},
+    want={'custom_status_id':int(m['custom_status_id'])}
+    # A form someone chose (not the target, not the account default) is kept as it is.
+    form=ticket.get('ticket_form_id')
+    if form in (None,'') or str(form) in (str(m['form_id']),str(default_form_id)):want['ticket_form_id']=int(m['form_id'])
+    else:notes.append('다른 양식이 지정되어 양식은 변경하지 않음')
+    fields=[]
+    # 관련파트
+    if current_value(ticket,m['part_field_id']) not in (None,'',[]):notes.append('관련파트에 이미 값이 있어 유지')
+    else:
+        parts=[a['part'] for a in job.get('recommended_assignments',[])]
+        options={p['name']:p.get('option_value') for p in c['settings'].get('parts',[])}
+        missing=[p for p in parts if not options.get(p)]
+        if missing:notes.append('관련파트 선택값 미설정: '+', '.join(missing))
+        values=list(dict.fromkeys(options[p] for p in parts if options.get(p)))
+        if values:fields.append({'id':int(m['part_field_id']),'value':values})
+        elif not parts:notes.append('추천 파트 없음')
+    # 운영팀 담당자 (PIS + 개발)
+    if current_value(ticket,m['developer_field_id']) not in (None,'',[]):notes.append('운영팀 담당자에 이미 값이 있어 유지')
+    else:
+        people=expected_people(job,c)
+        if not any(p['role']=='PIS' for p in people):notes.append('PIS 미배정')
+        if not any(p['role']=='개발' for p in people):notes.append('개발 담당자 없음')
+        missing=[p['name'] for p in people if not p['value']]
+        if missing:notes.append('운영팀 담당자 선택값 미설정: '+', '.join(missing))
+        values=list(dict.fromkeys(p['value'] for p in people if p['value']))
+        if values:fields.append({'id':int(m['developer_field_id']),'value':values})
+    if fields:want['custom_fields']=fields
+    want.update(comment={'body':body,'public':True},
         # Zendesk rejects the update with 409 if anyone changed the ticket after this stamp.
-        'safe_update':True,'updated_stamp':ticket['updated_at']}}
+        safe_update=True,updated_stamp=ticket['updated_at'])
+    return {'ticket':want,'notes':notes}
 
 def applied(ticket, payload):
     """True/False when the read-back is conclusive, None when it is not."""
-    want=payload['ticket'];fields={f['id']:f['value'] for f in want['custom_fields']}
+    want=payload['ticket'];fields={f['id']:f['value'] for f in want.get('custom_fields',[])}
     if str(ticket.get('custom_status_id'))==str(want['custom_status_id']) and all(
         sorted(current_value(ticket,k) or [])==sorted(v) for k,v in fields.items()):return True
     if ticket.get('status')=='new' and ticket.get('updated_at')==want['updated_stamp']:return False
