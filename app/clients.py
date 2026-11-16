@@ -293,7 +293,9 @@ class Telegram:
         token=os.getenv('TELEGRAM_BOT_TOKEN');chat=os.getenv('TELEGRAM_CHAT_ID')
         if not token or not chat:raise IntegrationError('Telegram 미설정')
         try:
-            r=httpx.post(f'https://api.telegram.org/bot{token}/sendMessage',json={'chat_id':chat,'text':text,'parse_mode':'HTML','disable_web_page_preview':True},timeout=20)
+            r=httpx.post(f'https://api.telegram.org/bot{token}/sendMessage',json={'chat_id':chat,'text':text,'parse_mode':'HTML','disable_web_page_preview':True},
+                # Telegram sometimes accepts the message but answers late (ReadTimeout = sent, unconfirmed): wait up to 120s.
+                timeout=httpx.Timeout(120,connect=10))
         except httpx.RequestError as e:
             # Do not expose request URL (contains token): only the exception class (e.g. ConnectTimeout, ConnectError).
             raise IntegrationError('Telegram 응답 확인 불가 ('+type(e).__name__+')') from None
