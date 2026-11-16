@@ -43,3 +43,5 @@
 .sheet-head h2 button{background:none;border:0;padding:0 10px;font-size:24px;font-weight:800;line-height:1;color:#0b2a4a;cursor:pointer}
 .sheet-head .share-toggle{position:absolute;right:16px;padding:2px 8px;font-size:11px;background:#fff}
 .sheet .pick select{font-weight:700}
+.daily-week-title{padding-top:16px}.daily-week-title small{color:var(--muted);margin-left:8px}.daily-past{padding-top:8px}.daily-past details{border-top:1px solid #edeef0;padding:10px 0}.daily-past details summary{padding:4px 0}.daily-past details .table-scroll{margin-top:8px}
+.daily-month>summary{padding:6px 0}.daily-month-weeks{padding-left:18px}

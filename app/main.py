@@ -177,8 +177,15 @@ def release_intake():
     finally:engine.run_lock.release()
     return {'ok':True}
 
-def daily_counts(jobs,today,days=14):
-    """Tickets per Zendesk creation date (KST) for the last two weeks, zero days included."""
+def daily_counts(jobs,today,days=None):
+    """Tickets per Zendesk creation date (KST), zero days included.
+    By default every day since the first ticket (at least 14, at most 366); the page groups them by week."""
+    if days is None:
+        first=today
+        for j in jobs:
+            try:first=min(first,datetime.fromisoformat(str(j.get('created_at')).replace('Z','+00:00')).astimezone(KST).date())
+            except ValueError:pass
+        days=min(366,max(14,(today-first).days+1))
     rows={(today-timedelta(days=i)).isoformat():{'total':0,'recommended':0,'review':0,'deferred':0,'other':0,'written':0} for i in range(days)}
     for j in jobs:
         try:d=datetime.fromisoformat(str(j.get('created_at')).replace('Z','+00:00')).astimezone(KST).date().isoformat()

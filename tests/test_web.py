@@ -189,6 +189,14 @@ def test_daily_counts_by_kst_creation_date():
     assert rows[0]|{}=={'date':'2026-11-04','total':2,'recommended':0,'review':1,'deferred':0,'other':1,'written':0}
     assert rows[1]['recommended']==1 and rows[1]['written']==1 and rows[2]['total']==0
 
+def test_daily_counts_default_covers_every_day_since_first_ticket():
+    from datetime import date
+    from app.main import daily_counts
+    assert len(daily_counts([],date(2026,11,17)))==14
+    rows=daily_counts([{'created_at':'2026-10-01T01:00:00Z','status':'review'}],date(2026,11,17))
+    assert rows[0]['date']=='2026-11-17' and rows[-1]['date']=='2026-10-01' and rows[-1]['total']==1
+    assert len(daily_counts([{'created_at':'2024-01-01T00:00:00Z'}],date(2026,11,17)))==366
+
 def test_oauth_uses_the_address_the_browser_opened(monkeypatch,tmp_path):
     from urllib.parse import urlparse,parse_qs
     from app import runtime

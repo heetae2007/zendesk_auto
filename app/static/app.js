@@ -26,14 +26,36 @@ function render(){
  ({overview,calendar,catalog,simulate,analytics,settings})[page]();
  // Widths set through the DOM: the CSP blocks inline style attributes.
  document.querySelectorAll('[data-w]').forEach(b=>b.style.width=b.dataset.w+'%');
+ document.querySelectorAll('details[data-week]').forEach(d=>d.addEventListener('toggle',()=>d.open?dailyOpen.add(d.dataset.week):dailyOpen.delete(d.dataset.week)));
 }
 const pisMembers=()=>conf.settings.pis_members||state.pis_members;
 const pisNamesActive=()=>pisMembers().filter(m=>m.active).map(m=>m.name);
 const devNamesActive=()=>conf.agents.filter(a=>a.name&&a.active&&!excludedAgent(a)).map(a=>a.name);
 
 // ---------- 01 접수 현황
+let dailyOpen=new Set();
 function dailyCard(){const max=Math.max(1,...state.daily.map(d=>d.total)),wd='일월화수목금토';
- return card('일자별 접수','<div class="table-scroll"><table><thead><tr><th>날짜</th><th>접수</th><th class="daily-bar-col"></th><th>추천 완료</th><th>검토 필요</th><th>운영일 대기</th><th>기타</th><th>실제 접수</th></tr></thead><tbody>'+state.daily.map(d=>{const w=wd[new Date(d.date+'T00:00:00Z').getUTCDay()];return `<tr class="${d.total?'':'muted-row'}"><td>${e(d.date.slice(5).replace('-','/'))} (${w})</td><td><b>${d.total}</b></td><td class="daily-bar-col"><span class="daily-bar" data-w="${Math.round(d.total/max*100)}"></span></td><td>${d.recommended}</td><td>${d.review}</td><td>${d.deferred}</td><td>${d.other}</td><td>${d.written}</td></tr>`}).join('')+'</tbody></table></div>')}
+ // Weeks start on Monday. The current week is always shown; earlier weeks fold into toggles (open ones stay open on refresh).
+ const monday=s=>{const t=new Date(s+'T00:00:00Z');t.setUTCDate(t.getUTCDate()-(t.getUTCDay()+6)%7);return t.toISOString().slice(0,10)};
+ const md=s=>s.slice(5).replace('-','/');
+ const head='<thead><tr><th>날짜</th><th>접수</th><th class="daily-bar-col"></th><th>추천 완료</th><th>검토 필요</th><th>운영일 대기</th><th>기타</th><th>실제 접수</th></tr></thead>';
+ const row=d=>{const w=wd[new Date(d.date+'T00:00:00Z').getUTCDay()];return `<tr class="${d.total?'':'muted-row'}"><td>${e(md(d.date))} (${w})</td><td><b>${d.total}</b></td><td class="daily-bar-col"><span class="daily-bar" data-w="${Math.round(d.total/max*100)}"></span></td><td>${d.recommended}</td><td>${d.review}</td><td>${d.deferred}</td><td>${d.other}</td><td>${d.written}</td></tr>`};
+ const table=rows=>`<div class="table-scroll"><table>${head}<tbody>${rows.map(row).join('')}</tbody></table></div>`;
+ const weeks=[];for(const d of state.daily){const k=monday(d.date);let w=weeks.find(x=>x.k===k);if(!w)weeks.push(w={k,days:[]});w.days.push(d)}
+ if(!weeks.length)return card('일자별 접수',table([]));
+ const [cur,...past]=weeks;
+ const sum=(w,f)=>w.days.reduce((n,d)=>n+d[f],0);
+ const end=k=>{const t=new Date(k+'T00:00:00Z');t.setUTCDate(t.getUTCDate()+6);return t.toISOString().slice(0,10)};
+ return card('일자별 접수',`<div class="pad-x daily-week-title"><b>이번 주</b> <small>${md(cur.k)} ~ ${md(end(cur.k))} · 접수 ${sum(cur,'total')}건 · 실제 접수 ${sum(cur,'written')}건</small></div>`+table(cur.days)+
+  (past.length?`<div class="pad daily-past">${pastHtml()}</div>`:''));
+ // Weeks of the current month are listed one by one; older weeks fold into one toggle per month,
+ // so a year of operation is at most ~4 week rows + 11 month rows.
+ function weekHtml(w){return `<details data-week="${w.k}" ${dailyOpen.has(w.k)?'open':''}><summary>${md(w.k)} ~ ${md(end(w.k))} · 접수 <b>${sum(w,'total')}</b>건 · 실제 접수 ${sum(w,'written')}건</summary>${table(w.days)}</details>`}
+ function pastHtml(){const month=cur.days[0].date.slice(0,7),recent=past.filter(w=>end(w.k).slice(0,7)>=month),months=[];
+  for(const w of past.filter(w=>end(w.k).slice(0,7)<month)){const k=end(w.k).slice(0,7);let m=months.find(x=>x.k===k);if(!m)months.push(m={k,weeks:[]});m.weeks.push(w)}
+  const msum=(m,f)=>m.weeks.reduce((n,w)=>n+sum(w,f),0);
+  return recent.map(weekHtml).join('')+months.map(m=>`<details class="daily-month" data-week="m${m.k}" ${dailyOpen.has('m'+m.k)?'open':''}><summary><b>${Number(m.k.slice(0,4))}년 ${Number(m.k.slice(5))}월</b> · 접수 <b>${msum(m,'total')}</b>건 · 실제 접수 ${msum(m,'written')}건 · ${m.weeks.length}주</summary><div class="daily-month-weeks">${m.weeks.map(weekHtml).join('')}</div></details>`).join('')}
+}
 function overview(){const counts={};state.jobs.forEach(j=>counts[j.status]=(counts[j.status]||0)+1);
  $('#content').innerHTML=`<div class="stats">${[['오늘 접수',state.daily[0].total],['오늘 추천 완료',state.daily[0].recommended],['오늘 검토 필요',state.daily[0].review],['운영일 대기 (전체)',counts.deferred||0]].map(([t,n])=>`<div class="stat"><small>${t}</small><b>${n}</b><span class="unit">건</span></div>`).join('')}</div>${dailyCard()}
  <div class="grid">${card('오늘의 운영',`<div class="pad"><div class="connection"><span>자동 분석</span><span class="badge">${conf.settings.enabled?'활성':'일시 중지'}</span></div><div class="connection"><span>운영 시간</span><b>${e(conf.settings.start)} — ${e(conf.settings.end)}</b></div><div class="connection"><span>현재</span><span>${e(state.operating_reason)}</span></div><div class="connection"><span>오늘 PIS 젠콜</span><span>${e(state.pis_today.on_call.map(m=>m.name+(m.share?` ${m.share}%`:'')).join(', ')||'미등록')}</span></div></div>`)}${card('연결 상태',`<div class="pad">${Object.entries(state.connections).map(([k,v])=>`<div class="connection"><span>${e(k)}</span><span class="badge ${v?'':'review'}">${v?'인증정보 설정됨':'미설정'}</span></div>`).join('')}<p class="help">저장소: ${e(state.storage)}</p></div>`)}</div>
