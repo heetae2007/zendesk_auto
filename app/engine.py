@@ -7,7 +7,7 @@ from .catalog import parts,works,resolve,pis_rows
 from .store import stamp,revision
 from .clients import IntegrationError,WriteRejected,model_for,error_detail
 from .telegram_format import format_notification
-from .pis import on_duty,pick_realtime,pick_backlog
+from .pis import on_duty,pick_realtime,pick_backlog,telegram_ids
 from .zendesk_write import live_enabled,build_update,applied,test_tickets,test_hospitals,test_mode,hospital_tags
 
 class Engine:
@@ -234,7 +234,7 @@ class Engine:
         existing=self.store.state['notifications'].get(key,{})
         if existing.get('status') in ('sent','unknown'):return
         self.store.state['notifications'][key]={'status':'unknown','at':stamp()};self.store.save_state()
-        text=format_notification(j,ticket_id=j['ticket_id'])
+        text=format_notification(j,ticket_id=j['ticket_id'],mentions=telegram_ids(c['settings']))
         try:
             message_id=self.telegram.send(text)
             self.store.state['notifications'][key]={'status':'sent','message_id':message_id,'at':stamp()}
@@ -257,7 +257,7 @@ class Engine:
                 t=key.split(':')[0];n=notes.get(key);j=jobs.get(t)
                 if not j or not n or n.get('status')!='unknown':skipped.append(int(t));continue
                 try:
-                    message_id=self.telegram.send(format_notification(j,ticket_id=j['ticket_id']))
+                    message_id=self.telegram.send(format_notification(j,ticket_id=j['ticket_id'],mentions=telegram_ids(self.store.config['settings'])))
                 except Exception as e:
                     detail=error_detail(e)
                     logging.getLogger('uvicorn.error').error('Telegram 재전송 실패 ticket=%s: %s',t,detail)

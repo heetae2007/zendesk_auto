@@ -5,7 +5,8 @@ from .domain import redact,allowed_agent
 def _safe(value, limit):
     return escape(redact(value or '')[:limit],quote=True)
 
-def format_notification(result, ticket_id=None, simulation=False):
+def format_notification(result, ticket_id=None, simulation=False, mentions=None):
+    """mentions: {PIS name: Telegram user id}. A PIS with an id is tagged so Telegram notifies them."""
     hospital=_safe(result.get('hospital') or '병원 확인 필요',100)
     urgent_prefix='[긴급] ' if result.get('urgent') else ''
     entries=result.get('recommended_assignments')
@@ -38,7 +39,10 @@ def format_notification(result, ticket_id=None, simulation=False):
         if person and not person.endswith('책임님'):person+=' 책임님'
         heading=urgent_prefix+f'[{hospital}] {part} {person or "담당자 미정"}'
     if result.get('pis_name'):
-        heading += ' / PIS ' + _safe(result['pis_name'],80) + ' 책임님'
+        pis=result['pis_name'];uid=str((mentions or {}).get(pis,'')).strip()
+        label=_safe(pis,80)+' 책임님'
+        # Text mention: works without a username and notifies the person. Digits only, so nothing can break the markup.
+        heading += ' / PIS ' + (f'<a href="tg://user?id={uid}">{label}</a>' if uid.isdigit() else label)
     # The raw ticket is never sent; only generated, pattern-masked summaries.
     summary=_safe(result.get('summary'),350) if result.get('confidence') is not None else ''
     if not summary:summary='문의 요약을 확인해 주세요.'

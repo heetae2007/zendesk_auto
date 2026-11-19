@@ -14,7 +14,7 @@ from .engine import Engine
 from .importer import import_xlsx
 from .analytics import Analytics
 from .telegram_format import format_notification
-from .pis import members,active_names,on_call,counts as pis_counts,normalize_schedule,prune_days
+from .pis import members,active_names,telegram_ids,on_call,counts as pis_counts,normalize_schedule,prune_days
 from .zendesk_write import live_enabled,preflight,suggest,expected_people,test_mode
 from .catalog import unknown_people
 
@@ -304,7 +304,7 @@ def simulate(body:dict):
     result['telegram_status']='not_requested'
     if body.get('send_telegram') is True:
         # Synthetic test only: no real ticket ID or Zendesk URL and no ticket mutation.
-        message=format_notification(result,simulation=True)
+        message=format_notification(result,simulation=True,mentions=telegram_ids(c['settings']))
         if not os.getenv('TELEGRAM_BOT_TOKEN') or not os.getenv('TELEGRAM_CHAT_ID'):
             result['telegram_status']='not_configured'
         else:

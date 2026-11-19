@@ -19,6 +19,10 @@ def default_members():
 def members(settings):
     return settings.get('pis_members') or default_members()
 
+def telegram_ids(settings):
+    """{name: Telegram user id} for active PIS members that have one; used to tag them in notifications."""
+    return {m['name']:str(m['telegram_id']) for m in members(settings) if m.get('active') and str(m.get('telegram_id') or '').strip()}
+
 def active_names(settings):
     return [m['name'] for m in members(settings) if m.get('active')]
 
@@ -61,6 +65,9 @@ def validate_settings(s, today=None):
         name=m.get('name','').strip() if isinstance(m.get('name'),str) else ''
         if not name or name in seen:raise ValueError('PIS 명단 이름이 비어 있거나 중복됩니다.')
         seen.add(name)
+        tid=m.get('telegram_id','')
+        if isinstance(tid,bool) or not isinstance(tid,(str,int)) or (str(tid).strip() and not re.fullmatch(r'\d{1,15}',str(tid).strip())):
+            raise ValueError(f'{name}: 텔레그램 ID는 숫자만 입력하세요.')
     dates=set()
     for d in s.get('pis_days',[]):
         date.fromisoformat(d['date'])
